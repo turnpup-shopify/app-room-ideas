@@ -1,0 +1,28 @@
+{
+  "outputDir": "~/Downloads/room-ideas",
+  "includeVendors": ["Uttermost"],
+  "requireInventory": true,
+  "maxImagesPerProduct": 3,
+  "productTypeCombinations": [
+    {
+      "name": "Living Room",
+      "types": ["Coffee Tables", "Accent Tables", "Sculptures"]
+    },
+    {
+      "name": "Living Room Alt",
+      "types": ["Coffee Tables", "Accent Tables", "Home Accessories"]
+    },
+    {
+      "name": "Entryway",
+      "types": ["Console Tables", "Accent Tables", "Home Accessories"]
+    },
+    {
+      "name": "Side Vignette",
+      "types": ["Accent Tables", "Sculptures", "Home Accessories"]
+    },
+    {
+      "name": "Console Vignette",
+      "types": ["Console Tables", "Accent Tables", "Sculptures"]
+    }
+  ]
+}

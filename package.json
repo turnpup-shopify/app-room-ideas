@@ -1,0 +1,23 @@
+{
+  "name": "app-room-ideas",
+  "version": "1.0.0",
+  "description": "HTGT Furniture room ideas generator — Vercel web app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "jszip": "^3.10.1",
+    "next": "^16.2.12",
+    "react": "^18",
+    "react-dom": "^18"
+  },
+  "devDependencies": {
+    "autoprefixer": "^10",
+    "postcss": "^8",
+    "tailwindcss": "^3"
+  }
+}
