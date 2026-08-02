@@ -36,7 +36,7 @@ export async function POST() {
         productType: p.productType,
         materials: p.materials,
         dimensions: p.dimensions,
-        images: p.images.slice(0, config.maxImagesPerProduct ?? 3),
+        images: p.images,
       })),
     }));
 
