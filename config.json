@@ -24,5 +24,9 @@
       "name": "Console Vignette",
       "types": ["Console Tables", "Accent Tables", "Sculptures"]
     }
-  ]
+  ],
+  "higgsfield": {
+    "model": "nano_banana_2",
+    "aspectRatio": "4:3"
+  }
 }

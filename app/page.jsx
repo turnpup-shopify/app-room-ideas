@@ -26,11 +26,39 @@ function badgeClass(style) {
 function RoomCard({ room }) {
   const [copied, setCopied] = useState(false);
   const [downloading, setDownloading] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [generatedImage, setGeneratedImage] = useState(null);
+  const [genError, setGenError] = useState(null);
 
   async function copyPrompt() {
     await navigator.clipboard.writeText(room.prompt);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  }
+
+  async function generateImage() {
+    setGenerating(true);
+    setGenError(null);
+    try {
+      const res = await fetch('/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: room.prompt,
+          products: room.products.map((p) => ({
+            title: p.title,
+            images: p.images,
+          })),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? 'Generation failed');
+      setGeneratedImage(data.imageUrl);
+    } catch (err) {
+      setGenError(err.message);
+    } finally {
+      setGenerating(false);
+    }
   }
 
   async function downloadZip() {
@@ -67,6 +95,38 @@ function RoomCard({ room }) {
 
   return (
     <div className="bg-white rounded-2xl shadow-sm border border-stone-200 overflow-hidden flex flex-col">
+      {/* Generated image */}
+      {generatedImage && (
+        <div className="relative">
+          <img
+            src={generatedImage}
+            alt={`Generated ${room.style} room scene`}
+            className="w-full aspect-[4/3] object-cover"
+          />
+          <span className="absolute top-2 left-2 text-xs font-medium bg-violet-600 text-white px-2 py-0.5 rounded-full">
+            AI Generated
+          </span>
+        </div>
+      )}
+
+      {/* Generating spinner */}
+      {generating && (
+        <div className="flex items-center justify-center gap-3 py-8 bg-violet-50">
+          <svg className="animate-spin h-5 w-5 text-violet-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+          </svg>
+          <span className="text-sm text-violet-700 font-medium">Generating scene...</span>
+        </div>
+      )}
+
+      {/* Generation error */}
+      {genError && (
+        <div className="mx-5 mt-4 p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700">
+          {genError}
+        </div>
+      )}
+
       {/* Card header */}
       <div className="flex items-center justify-between px-5 py-4 border-b border-stone-100">
         <span className={`text-xs font-semibold uppercase tracking-widest px-3 py-1 rounded-full ${badgeClass(room.style)}`}>
@@ -130,6 +190,13 @@ function RoomCard({ room }) {
           className="flex-1 text-sm font-medium py-2 rounded-lg bg-stone-900 text-white hover:bg-stone-700 disabled:opacity-50 disabled:cursor-wait transition-colors"
         >
           {downloading ? 'Packaging...' : 'Download ZIP'}
+        </button>
+        <button
+          onClick={generateImage}
+          disabled={generating}
+          className="flex-1 text-sm font-medium py-2 rounded-lg bg-violet-600 text-white hover:bg-violet-500 disabled:opacity-50 disabled:cursor-wait transition-colors"
+        >
+          {generating ? 'Generating...' : generatedImage ? 'Regenerate' : 'Generate Image'}
         </button>
       </div>
     </div>
