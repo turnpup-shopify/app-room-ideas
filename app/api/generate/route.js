@@ -27,13 +27,13 @@ export async function POST(request) {
 
   const config = getConfig();
   const model = config.higgsfield?.model ?? 'nano_banana_2';
-  const aspectRatio = config.higgsfield?.aspectRatio ?? '4:3';
 
   let tempDir = null;
   activeGenerations++;
 
   try {
-    const { prompt, products } = await request.json();
+    const { prompt, products, aspectRatio: requestedAspectRatio } = await request.json();
+    const aspectRatio = requestedAspectRatio ?? config.higgsfield?.aspectRatio ?? '1:1';
 
     if (!prompt || !Array.isArray(products)) {
       return NextResponse.json(
@@ -46,9 +46,12 @@ export async function POST(request) {
     tempDir = join(tmpdir(), `higgsfield-${randomUUID()}`);
     await mkdir(tempDir, { recursive: true });
 
+    const MAX_IMAGE_REFS = 14;
     const imagePaths = [];
     for (const product of products) {
+      if (imagePaths.length >= MAX_IMAGE_REFS) break;
       for (const url of product.images ?? []) {
+        if (imagePaths.length >= MAX_IMAGE_REFS) break;
         try {
           // Downscale Shopify images to 512px wide
           const fetchUrl = url.includes('cdn.shopify.com')

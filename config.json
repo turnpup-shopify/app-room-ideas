@@ -1,32 +1,145 @@
 {
   "outputDir": "~/Downloads/room-ideas",
   "includeVendors": ["Uttermost"],
+  "excludeTags": ["need-optimization"],
   "requireInventory": true,
   "maxImagesPerProduct": 3,
   "productTypeCombinations": [
     {
       "name": "Living Room",
-      "types": ["Coffee Tables", "Accent Tables", "Sculptures"]
+      "types": ["Coffee Tables", "Accent Tables", "Table Lamps"]
     },
     {
       "name": "Living Room Alt",
-      "types": ["Coffee Tables", "Accent Tables", "Home Accessories"]
+      "types": ["Coffee Tables", "Accent Tables", "Vases"]
+    },
+    {
+      "name": "Living Room Sculpted",
+      "types": ["Coffee Tables", "Sculptures", "Table Lamps"]
     },
     {
       "name": "Entryway",
-      "types": ["Console Tables", "Accent Tables", "Home Accessories"]
+      "types": ["Console Tables", "Mirrors", "Table Lamps"]
+    },
+    {
+      "name": "Entryway Alt",
+      "types": ["Console Tables", "Mirrors", "Vases"]
+    },
+    {
+      "name": "Entryway Gallery",
+      "types": ["Console Tables", "Artwork", "Vases"]
+    },
+    {
+      "name": "Bedroom",
+      "types": ["Benches", "Mirrors", "Table Lamps"]
+    },
+    {
+      "name": "Bedroom Alt",
+      "types": ["Accent Tables", "Mirrors", "Table Lamps"]
+    },
+    {
+      "name": "Bedroom Dresser",
+      "types": ["Dressers", "Mirrors", "Table Lamps"]
+    },
+    {
+      "name": "Reading Nook",
+      "types": ["Accent Chairs", "Accent Tables", "Table Lamps"]
+    },
+    {
+      "name": "Reading Nook Alt",
+      "types": ["Accent Chairs", "Floor Lamps", "Accent Tables"]
+    },
+    {
+      "name": "Hallway",
+      "types": ["Console Tables", "Mirrors", "Bowls"]
     },
     {
       "name": "Side Vignette",
-      "types": ["Accent Tables", "Sculptures", "Home Accessories"]
+      "types": ["Accent Tables", "Vases", "Table Lamps"]
+    },
+    {
+      "name": "Side Vignette Alt",
+      "types": ["Accent Tables", "Bowls", "Table Lamps"]
     },
     {
       "name": "Console Vignette",
-      "types": ["Console Tables", "Accent Tables", "Sculptures"]
+      "types": ["Console Tables", "Accent Tables", "Mirrors"]
+    },
+    {
+      "name": "Console Styled",
+      "types": ["Console Tables", "Trays", "Vases"]
+    },
+    {
+      "name": "Bench Nook",
+      "types": ["Benches", "Mirrors", "Artwork"]
+    },
+    {
+      "name": "Bench Nook Alt",
+      "types": ["Benches", "Pillows", "Mirrors"]
+    },
+    {
+      "name": "Lounge Corner",
+      "types": ["Accent Chairs", "Coffee Tables", "Floor Lamps"]
+    },
+    {
+      "name": "Gallery Wall",
+      "types": ["Benches", "Artwork", "Sculptures"]
+    },
+    {
+      "name": "Accent Display",
+      "types": ["Accent Tables", "Sculptures", "Vases"]
+    },
+    {
+      "name": "Dining Room",
+      "types": ["Kitchen & Dining Room Chairs", "Lighting", "Bowls"]
+    },
+    {
+      "name": "Dining Vignette",
+      "types": ["Kitchen & Dining Room Chairs", "Vases", "Trays"]
+    },
+    {
+      "name": "Bar Area",
+      "types": ["Bar and Counter Stools", "Accent Tables", "Trays"]
+    },
+    {
+      "name": "Ottoman Lounge",
+      "types": ["Ottomans", "Coffee Tables", "Table Lamps"]
+    },
+    {
+      "name": "Sitting Room",
+      "types": ["Accent Chairs", "Ottomans", "Accent Tables"]
+    },
+    {
+      "name": "Vanity",
+      "types": ["Dressers", "Mirrors", "Trays"]
+    },
+    {
+      "name": "Shelf Styling",
+      "types": ["Vases", "Sculptures", "Bowls"]
+    },
+    {
+      "name": "Lamp Vignette",
+      "types": ["Table Lamps", "Accent Tables", "Artwork"]
+    },
+    {
+      "name": "Cozy Corner",
+      "types": ["Benches", "Table Lamps", "Pillows"]
     }
+  ],
+  "accessories": [
+    "An alabaster mushroom table lamp glows softly on the side table.",
+    "A chrome lava lamp casts slow-moving light on the console.",
+    "A stack of oversized Rizzoli art books sits on the coffee table.",
+    "A pair of sculptural bronze candle holders with tapered cream candles sit on the tray.",
+    "A large organic travertine sculpture anchors the accent table.",
+    "A Le Labo Santal 26 candle in a matte black ceramic vessel burns on the side table.",
+    "An iridescent blown-glass vase catches prismatic light near the window.",
+    "A vintage Murano glass bowl is displayed as a decorative object on the shelf.",
+    "A large-format Taschen Helmut Newton SUMO book leans against the wall.",
+    "A lacquered red toadstool lamp with a heavy brass base sits on the nightstand."
   ],
   "higgsfield": {
     "model": "nano_banana_2",
-    "aspectRatio": "4:3"
+    "aspectRatio": "1:1"
   }
 }
