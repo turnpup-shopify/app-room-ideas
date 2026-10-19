@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import Image from 'next/image';
 
 // ─── Style badge colors ───────────────────────────────────────────────────────
@@ -45,7 +45,10 @@ const SCENE_FIELDS = [
 const PRODUCT_FIDELITY_INSTRUCTION =
   'Product fidelity (critical): Every featured product must be reproduced exactly as shown in the reference images. ' +
   'Do not alter the color, finish, material, texture, shape, silhouette, scale, or proportions of any product under any circumstances. ' +
-  'Do not reinterpret, stylize, or adapt the products to match the scene — the scene must be built around the products as they are.';
+  'Do not reinterpret, stylize, or adapt the products to match the scene — the scene must be built around the products as they are. ' +
+  'Dimensional accuracy: When dimensions are given (e.g. 10W x 10D x 22H), the rendered product must match those proportions exactly — ' +
+  'a narrow, delicate table must stay narrow and delicate, not become wider, chunkier, or more substantial. ' +
+  'Preserve the exact thickness of table tops, the slenderness of legs and bases, and the overall visual weight of each piece.';
 
 function assemblePromptFromScene(scene, itemList) {
   const parts = [];
@@ -102,10 +105,18 @@ function PinterestIcon({ className }) {
 }
 
 // ─── RoomCard ─────────────────────────────────────────────────────────────────
-function RoomCard({ room, mode }) {
+function RoomCard({ room, mode, combinationNames = [], accessoriesList = [], featuredProductHandles = [] }) {
   const [prompt, setPrompt] = useState(room.prompt);
   const [scene, setScene] = useState(room.scene);
   const [sceneOpen, setSceneOpen] = useState(false);
+  const [productsOpen, setProductsOpen] = useState(false);
+  const [allScenes, setAllScenes] = useState(null);
+  const [products, setProducts] = useState(room.products);
+  const [combinationName, setCombinationName] = useState(room.combinationName);
+  const [reshuffling, setReshuffling] = useState(false);
+  const [comboPickerOpen, setComboPickerOpen] = useState(false);
+  const [accessoryPickerOpen, setAccessoryPickerOpen] = useState(false);
+  const [accessorySelection, setAccessorySelection] = useState(new Set());
   const [syncing, setSyncing] = useState(false);
   const [syncStatus, setSyncStatus] = useState(null); // 'ok' | { error: string }
   // Per-slot alternative index: -1 = original product, 0+ = index into alternatives array
@@ -113,7 +124,7 @@ function RoomCard({ room, mode }) {
   const [selectedIds, setSelectedIds] = useState(() => new Set(room.products.map((p) => p.id)));
 
   // Derive the currently-displayed product per slot
-  const activeProducts = room.products.map((original, i) => {
+  const activeProducts = products.map((original, i) => {
     const altIdx = activeAlts.get(i) ?? -1;
     if (altIdx < 0 || !original.alternatives?.length) return original;
     return original.alternatives[altIdx] || original;
@@ -156,7 +167,7 @@ function RoomCard({ room, mode }) {
 
   // Cycle to a different alternative for a slot
   function cycleSlot(slotIndex, direction) {
-    const original = room.products[slotIndex];
+    const original = products[slotIndex];
     const alts = original.alternatives || [];
     const totalOptions = 1 + alts.length; // original + alternatives
     if (totalOptions <= 1) return;
@@ -204,7 +215,75 @@ function RoomCard({ room, mode }) {
     }
   }
 
+  // Fetch all scene templates (lazy — first time scene breakdown opens or randomize is clicked)
+  async function ensureAllScenes() {
+    if (allScenes) return allScenes;
+    try {
+      const res = await fetch('/api/scenes');
+      const data = await res.json();
+      setAllScenes(data);
+      return data;
+    } catch {
+      return null;
+    }
+  }
+
+  // Randomize a single scene field from a random scene template
+  async function randomizeField(key) {
+    const scenes = await ensureAllScenes();
+    if (!scenes || scenes.length === 0) return;
+    // Collect non-empty values for this field (excluding current value)
+    const candidates = scenes
+      .map((s) => s[key])
+      .filter((v) => v && v !== scene[key]);
+    if (candidates.length === 0) return;
+    const pick = candidates[Math.floor(Math.random() * candidates.length)];
+    updateSceneField(key, pick);
+  }
+
+  async function reshuffle(targetRoomType) {
+    setReshuffling(true);
+    try {
+      const body = {
+        style: room.style,
+        productCount: products.length,
+      };
+      if (targetRoomType) body.roomType = targetRoomType;
+      const activeHandles = featuredProductHandles.filter(h => h.trim());
+      if (activeHandles.length > 0) body.featuredProductHandles = activeHandles;
+      const res = await fetch('/api/rooms/reshuffle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? 'Reshuffle failed');
+
+      setProducts(data.products);
+      setCombinationName(data.combinationName);
+      setActiveAlts(new Map());
+      const newSelected = new Set(data.products.map((p) => p.id));
+      setSelectedIds(newSelected);
+
+      const newItemList = buildItemList(data.products, newSelected);
+      if (newItemList) setPrompt(assemblePromptFromScene(scene, newItemList));
+
+      setGeneratedImage(null);
+      setPublished(false);
+      setPublishError(null);
+      setLinkWarning(null);
+      setPinImage(null);
+      setPinSaved(false);
+    } catch (err) {
+      console.error('Reshuffle failed:', err.message);
+    } finally {
+      setReshuffling(false);
+    }
+  }
+
   function resetAll() {
+    setProducts(room.products);
+    setCombinationName(room.combinationName);
     setPrompt(room.prompt);
     setScene(room.scene);
     setSyncStatus(null);
@@ -280,7 +359,7 @@ function RoomCard({ room, mode }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           imageUrl: generatedImage,
-          roomName: `${room.style} ${room.combinationName}`,
+          roomName: `${room.style} ${combinationName}`,
           style: room.style,
           scene,
           products: activeProducts
@@ -329,11 +408,11 @@ function RoomCard({ room, mode }) {
   }
 
   async function savePin(imageUrl) {
-    if (!imageUrl) return;
+    if (!imageUrl || savingPin || pinSaved) return;
     setSavingPin(true);
     setPinError(null);
     try {
-      const filename = `${room.style}-${room.combinationName}`
+      const filename = `${room.style}-${combinationName}`
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '-') + `-${Date.now()}`;
       const res = await fetch('/api/save-pin', {
@@ -376,7 +455,7 @@ function RoomCard({ room, mode }) {
     <div className="bg-white rounded-2xl shadow-sm border border-stone-200 overflow-hidden flex flex-col">
       {/* Generated image */}
       {generatedImage && (
-        <div className="relative">
+        <div className="relative group">
           <img
             src={generatedImage}
             alt={`Generated ${room.style} room scene`}
@@ -385,6 +464,28 @@ function RoomCard({ room, mode }) {
           <span className="absolute top-2 left-2 text-xs font-medium bg-violet-600 text-white px-2 py-0.5 rounded-full">
             AI Generated
           </span>
+          <button
+            onClick={async () => {
+              try {
+                const res = await fetch(generatedImage);
+                const blob = await res.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `${room.style}-${combinationName}`.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.png';
+                a.click();
+                URL.revokeObjectURL(url);
+              } catch {
+                window.open(generatedImage, '_blank');
+              }
+            }}
+            className="absolute top-2 right-2 w-8 h-8 rounded-full bg-black/50 hover:bg-black/70 flex items-center justify-center text-white opacity-0 group-hover:opacity-100 transition-opacity"
+            title="Save image"
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+            </svg>
+          </button>
         </div>
       )}
 
@@ -415,13 +516,95 @@ function RoomCard({ room, mode }) {
         <span className={`text-xs font-semibold uppercase tracking-widest px-3 py-1 rounded-full ${badgeClass(room.style)}`}>
           {room.style}
         </span>
-        <span className="text-xs text-stone-400">{room.combinationName}</span>
+        <div className="flex items-center gap-1.5">
+          <span className="text-[10px] font-medium text-stone-400 uppercase tracking-wide">Combo:</span>
+          {combinationNames.length > 1 && (
+            <button
+              onClick={() => {
+                const idx = combinationNames.indexOf(combinationName);
+                const prev = combinationNames[(idx - 1 + combinationNames.length) % combinationNames.length];
+                reshuffle(prev);
+              }}
+              disabled={reshuffling}
+              className="w-5 h-5 rounded bg-stone-100 hover:bg-stone-200 flex items-center justify-center text-stone-500 disabled:opacity-50"
+            >
+              <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
+              </svg>
+            </button>
+          )}
+          <button
+            onClick={() => setComboPickerOpen(true)}
+            disabled={reshuffling}
+            className="text-xs text-stone-500 hover:text-stone-700 px-1 hover:underline disabled:opacity-50 disabled:no-underline"
+          >
+            {reshuffling ? 'Loading…' : combinationName}
+          </button>
+          {combinationNames.length > 1 && (
+            <button
+              onClick={() => {
+                const idx = combinationNames.indexOf(combinationName);
+                const next = combinationNames[(idx + 1) % combinationNames.length];
+                reshuffle(next);
+              }}
+              disabled={reshuffling}
+              className="w-5 h-5 rounded bg-stone-100 hover:bg-stone-200 flex items-center justify-center text-stone-500 disabled:opacity-50"
+            >
+              <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+              </svg>
+            </button>
+          )}
+        </div>
       </div>
+
+      {/* Combination picker modal */}
+      {comboPickerOpen && (
+        <>
+          <div className="fixed inset-0 bg-black/30 z-40" onClick={() => setComboPickerOpen(false)} />
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4" onClick={() => setComboPickerOpen(false)}>
+            <div
+              className="bg-white rounded-2xl shadow-xl border border-stone-200 w-full max-w-sm max-h-[70vh] flex flex-col"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between px-5 py-4 border-b border-stone-100">
+                <h3 className="text-sm font-semibold text-stone-800">Choose Combination</h3>
+                <button
+                  onClick={() => setComboPickerOpen(false)}
+                  className="text-stone-400 hover:text-stone-600 transition-colors"
+                >
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+              <div className="overflow-y-auto py-2">
+                {combinationNames.map((name) => (
+                  <button
+                    key={name}
+                    onClick={() => {
+                      setComboPickerOpen(false);
+                      if (name !== combinationName) reshuffle(name);
+                    }}
+                    className={`w-full text-left px-5 py-2.5 text-sm transition-colors ${
+                      name === combinationName
+                        ? 'bg-stone-100 text-stone-900 font-medium'
+                        : 'text-stone-600 hover:bg-stone-50'
+                    }`}
+                  >
+                    {name}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </>
+      )}
 
       {/* Product images — click to toggle inclusion in the scene */}
       <div className="flex gap-3 p-5">
         {activeProducts.map((product, slotIdx) => {
-          const original = room.products[slotIdx];
+          const original = products[slotIdx];
           const alts = original.alternatives || [];
           const totalOptions = 1 + alts.length;
           const hasAlts = totalOptions > 1;
@@ -499,6 +682,129 @@ function RoomCard({ room, mode }) {
         })}
       </div>
 
+      {/* Product combination panel */}
+      <div className="mx-5 mb-3 border border-stone-200 rounded-xl overflow-hidden">
+        <button
+          onClick={() => setProductsOpen((o) => !o)}
+          className="flex items-center justify-between w-full px-4 py-2.5 bg-stone-50 hover:bg-stone-100 transition-colors text-left"
+        >
+          <span className="text-xs font-medium text-stone-500 uppercase tracking-wide">
+            Products ({activeProducts.filter((p) => selectedIds.has(p.id)).length}/{activeProducts.length})
+          </span>
+          <svg
+            className={`w-3.5 h-3.5 text-stone-400 transition-transform ${productsOpen ? 'rotate-180' : ''}`}
+            fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+          </svg>
+        </button>
+
+        {productsOpen && (
+          <div className="border-t border-stone-200">
+            <div className="px-4 py-2.5 flex items-center gap-2 border-b border-stone-100">
+              <button
+                type="button"
+                onClick={() => {
+                  const nextAlts = new Map();
+                  const nextSelected = new Set();
+                  products.forEach((original, slotIdx) => {
+                    const alts = original.alternatives || [];
+                    const totalOptions = 1 + alts.length;
+                    // Pick a random option for this slot
+                    const pick = Math.floor(Math.random() * totalOptions) - 1; // -1 = original
+                    nextAlts.set(slotIdx, pick);
+                    const product = pick < 0 ? original : (alts[pick] || original);
+                    nextSelected.add(product.id);
+                  });
+                  setActiveAlts(nextAlts);
+                  setSelectedIds(nextSelected);
+                }}
+                className="flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg bg-stone-100 text-stone-500 hover:bg-stone-200 hover:text-stone-700 transition-colors"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                Shuffle Products
+              </button>
+            </div>
+            <div className="divide-y divide-stone-100">
+            {activeProducts.map((product, slotIdx) => {
+              const original = products[slotIdx];
+              const alts = original.alternatives || [];
+              const totalOptions = 1 + alts.length;
+              const hasAlts = totalOptions > 1;
+              const currentPos = (activeAlts.get(slotIdx) ?? -1) + 1;
+              const selected = selectedIds.has(product.id);
+              return (
+                <div
+                  key={`prod-panel-${slotIdx}`}
+                  className={`flex items-center gap-3 px-4 py-3 transition-opacity ${selected ? 'opacity-100' : 'opacity-40'}`}
+                >
+                  {/* Thumbnail */}
+                  <div className="w-10 h-10 rounded-lg overflow-hidden bg-stone-100 flex-shrink-0 relative">
+                    {product.images[0] ? (
+                      <Image
+                        src={product.images[0]}
+                        alt={product.title}
+                        fill
+                        className="object-cover"
+                        sizes="40px"
+                      />
+                    ) : (
+                      <div className="w-full h-full flex items-center justify-center text-stone-300 text-[8px]">N/A</div>
+                    )}
+                  </div>
+
+                  {/* Details */}
+                  <div className="flex-1 min-w-0">
+                    <p className="text-xs font-medium text-stone-700 truncate">{product.title}</p>
+                    <p className="text-[10px] text-stone-400 truncate">
+                      {product.productType}
+                      {product.materials ? ` · ${product.materials}` : ''}
+                    </p>
+                  </div>
+
+                  {/* Alt cycling */}
+                  {hasAlts && (
+                    <div className="flex items-center gap-1 flex-shrink-0">
+                      <button
+                        onClick={() => cycleSlot(slotIdx, -1)}
+                        className="w-5 h-5 rounded bg-stone-100 hover:bg-stone-200 flex items-center justify-center text-stone-500"
+                      >
+                        <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
+                        </svg>
+                      </button>
+                      <span className="text-[10px] text-stone-400 w-7 text-center">{currentPos + 1}/{totalOptions}</span>
+                      <button
+                        onClick={() => cycleSlot(slotIdx, 1)}
+                        className="w-5 h-5 rounded bg-stone-100 hover:bg-stone-200 flex items-center justify-center text-stone-500"
+                      >
+                        <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                        </svg>
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Toggle inclusion */}
+                  <button
+                    onClick={() => toggleProduct(product.id)}
+                    className={`w-5 h-5 rounded-full flex-shrink-0 flex items-center justify-center text-white text-xs font-bold ${
+                      selected ? 'bg-green-500 hover:bg-red-400' : 'bg-stone-300 hover:bg-green-400'
+                    } transition-colors`}
+                    title={selected ? 'Remove from scene' : 'Add to scene'}
+                  >
+                    {selected ? '\u2713' : '+'}
+                  </button>
+                </div>
+              );
+            })}
+            </div>
+          </div>
+        )}
+      </div>
+
       {/* Prompt */}
       <div className="px-5 pb-2 flex-1">
         <div className="flex items-center justify-between mb-1">
@@ -541,11 +847,50 @@ function RoomCard({ room, mode }) {
 
           {sceneOpen && scene && (
             <div className="p-4 space-y-3 border-t border-stone-200">
+              <button
+                type="button"
+                onClick={async () => {
+                  const scenes = await ensureAllScenes();
+                  if (!scenes || scenes.length === 0) return;
+                  const newScene = { ...scene };
+                  for (const { key } of SCENE_FIELDS) {
+                    const candidates = scenes.map((s) => s[key]).filter(Boolean);
+                    if (candidates.length > 0) {
+                      newScene[key] = candidates[Math.floor(Math.random() * candidates.length)];
+                    }
+                  }
+                  setScene(newScene);
+                  const currentItemList = buildItemList(activeProducts, selectedIds);
+                  if (currentItemList) {
+                    setPrompt(assemblePromptFromScene(newScene, currentItemList));
+                  } else if (room.itemList) {
+                    setPrompt(assemblePromptFromScene(newScene, room.itemList));
+                  }
+                }}
+                className="flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg bg-stone-100 text-stone-500 hover:bg-stone-200 hover:text-stone-700 transition-colors"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                Shuffle All Fields
+              </button>
               {SCENE_FIELDS.map(({ key, label, multiline }) => (
                 <div key={key}>
-                  <label className="block text-xs font-medium text-stone-400 mb-1">
-                    {label}
-                  </label>
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <label className="text-xs font-medium text-stone-400">
+                      {label}
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => randomizeField(key)}
+                      title={`Randomize ${label}`}
+                      className="p-0.5 rounded hover:bg-stone-200 text-stone-400 hover:text-stone-600 transition-colors"
+                    >
+                      <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                      </svg>
+                    </button>
+                  </div>
                   {multiline ? (
                     <textarea
                       value={scene[key] || ''}
@@ -564,11 +909,31 @@ function RoomCard({ room, mode }) {
                 </div>
               ))}
 
-              {/* Accessories — sourced from the Accessories tab, editable per card */}
+              {/* Accessories — sourced from config, picker + editable textarea */}
               <div>
-                <label className="block text-xs font-medium text-stone-400 mb-1">
-                  Accessories
-                </label>
+                <div className="flex items-center gap-1.5 mb-1">
+                  <label className="text-xs font-medium text-stone-400">
+                    Accessories
+                  </label>
+                  {accessoriesList.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        // Pre-select accessories that match current text
+                        const current = scene.accessories || '';
+                        const sel = new Set();
+                        accessoriesList.forEach((item, i) => {
+                          if (current.includes(item)) sel.add(i);
+                        });
+                        setAccessorySelection(sel);
+                        setAccessoryPickerOpen(true);
+                      }}
+                      className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-stone-100 text-stone-500 hover:bg-stone-200 hover:text-stone-700 transition-colors"
+                    >
+                      Choose
+                    </button>
+                  )}
+                </div>
                 <textarea
                   value={scene.accessories || ''}
                   onChange={(e) => updateSceneField('accessories', e.target.value)}
@@ -577,6 +942,83 @@ function RoomCard({ room, mode }) {
                   className="w-full text-xs text-stone-700 bg-stone-50 border border-stone-200 rounded-lg p-2 resize-none focus:outline-none focus:ring-1 focus:ring-stone-300 font-mono leading-relaxed"
                 />
               </div>
+
+              {/* Accessories picker modal */}
+              {accessoryPickerOpen && (
+                <>
+                  <div className="fixed inset-0 bg-black/30 z-40" onClick={() => setAccessoryPickerOpen(false)} />
+                  <div className="fixed inset-0 z-50 flex items-center justify-center p-4" onClick={() => setAccessoryPickerOpen(false)}>
+                    <div
+                      className="bg-white rounded-2xl shadow-xl border border-stone-200 w-full max-w-md max-h-[70vh] flex flex-col"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <div className="flex items-center justify-between px-5 py-4 border-b border-stone-100">
+                        <h3 className="text-sm font-semibold text-stone-800">Choose Accessories</h3>
+                        <button
+                          onClick={() => setAccessoryPickerOpen(false)}
+                          className="text-stone-400 hover:text-stone-600 transition-colors"
+                        >
+                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                          </svg>
+                        </button>
+                      </div>
+                      <div className="overflow-y-auto py-2 flex-1">
+                        {accessoriesList.map((item, i) => {
+                          const checked = accessorySelection.has(i);
+                          return (
+                            <button
+                              key={i}
+                              onClick={() => {
+                                const next = new Set(accessorySelection);
+                                if (checked) next.delete(i); else next.add(i);
+                                setAccessorySelection(next);
+                              }}
+                              className={`w-full text-left px-5 py-3 text-xs font-mono leading-relaxed transition-colors flex items-start gap-3 ${
+                                checked ? 'bg-stone-100' : 'hover:bg-stone-50'
+                              }`}
+                            >
+                              <span className={`mt-0.5 w-4 h-4 rounded border flex-shrink-0 flex items-center justify-center ${
+                                checked ? 'bg-stone-800 border-stone-800 text-white' : 'border-stone-300'
+                              }`}>
+                                {checked && (
+                                  <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                                    <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                                  </svg>
+                                )}
+                              </span>
+                              <span className="text-stone-600">{item}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <div className="px-5 py-4 border-t border-stone-100 flex items-center justify-between gap-3">
+                        <span className="text-xs text-stone-400">
+                          {accessorySelection.size} selected
+                        </span>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => setAccessoryPickerOpen(false)}
+                            className="text-xs font-medium px-3 py-1.5 rounded-lg bg-stone-100 text-stone-500 hover:bg-stone-200 transition-colors"
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            onClick={() => {
+                              const selected = accessoriesList.filter((_, i) => accessorySelection.has(i));
+                              updateSceneField('accessories', selected.join(' '));
+                              setAccessoryPickerOpen(false);
+                            }}
+                            className="text-xs font-medium px-3 py-1.5 rounded-lg bg-stone-800 text-white hover:bg-stone-700 transition-colors"
+                          >
+                            Apply
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </>
+              )}
 
               {/* Sync to sheet */}
               <div className="flex items-center gap-3 pt-1">
@@ -752,6 +1194,178 @@ const selectClass =
 const inputClass =
   'text-sm text-stone-700 bg-white border border-stone-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-stone-400 placeholder:text-stone-400 w-48';
 
+// ─── Product search picker ────────────────────────────────────────────────────
+function ProductSearchPicker({ value, onChange }) {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState([]);
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [highlightIdx, setHighlightIdx] = useState(-1);
+  const containerRef = useRef(null);
+  const inputRef = useRef(null);
+  const listRef = useRef(null);
+  const debounceRef = useRef(null);
+
+  const fetchProducts = useCallback(async (q) => {
+    setLoading(true);
+    try {
+      const url = q ? `/api/products/search?q=${encodeURIComponent(q)}` : '/api/products/search';
+      const res = await fetch(url);
+      if (res.ok) {
+        const data = await res.json();
+        setResults(data);
+        setHighlightIdx(-1);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // Debounced search on query change
+  useEffect(() => {
+    if (!open) return;
+    clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => fetchProducts(query), 300);
+    return () => clearTimeout(debounceRef.current);
+  }, [query, open, fetchProducts]);
+
+  // Click-outside to close
+  useEffect(() => {
+    function handleClick(e) {
+      if (containerRef.current && !containerRef.current.contains(e.target)) {
+        setOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, []);
+
+  // Scroll highlighted item into view
+  useEffect(() => {
+    if (highlightIdx < 0 || !listRef.current) return;
+    const item = listRef.current.children[highlightIdx];
+    if (item) item.scrollIntoView({ block: 'nearest' });
+  }, [highlightIdx]);
+
+  function handleOpen() {
+    if (!open) {
+      setOpen(true);
+      setQuery('');
+      setHighlightIdx(-1);
+      fetchProducts('');
+    }
+  }
+
+  function handleKeyDown(e) {
+    if (!open) return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setHighlightIdx((i) => (i < results.length - 1 ? i + 1 : 0));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setHighlightIdx((i) => (i > 0 ? i - 1 : results.length - 1));
+    } else if (e.key === 'Enter' && highlightIdx >= 0 && results[highlightIdx]) {
+      e.preventDefault();
+      select(results[highlightIdx]);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      setOpen(false);
+    }
+  }
+
+  function select(product) {
+    onChange(product);
+    setQuery('');
+    setOpen(false);
+  }
+
+  function clear(e) {
+    e.stopPropagation();
+    onChange(null);
+    setQuery('');
+    // Focus the input after clearing so user can immediately search again
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }
+
+  return (
+    <div ref={containerRef} className="relative">
+      {value ? (
+        <div className="flex items-center gap-2 text-sm text-stone-700 bg-amber-50 border border-amber-300 rounded-lg px-2.5 py-1.5 h-[38px]">
+          {value.thumbnail && (
+            <img src={value.thumbnail + '&width=48'} alt="" className="w-6 h-6 rounded object-cover shrink-0" />
+          )}
+          <span className="truncate max-w-[180px] font-medium">{value.title}</span>
+          {value.productType && (
+            <span className="text-xs text-amber-500 truncate max-w-[80px] hidden sm:inline">{value.productType}</span>
+          )}
+          <button onClick={clear} className="text-amber-400 hover:text-amber-700 ml-0.5 leading-none text-base shrink-0" title="Remove product">&times;</button>
+        </div>
+      ) : (
+        <div className="relative">
+          <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-stone-400 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z" />
+          </svg>
+          <input
+            ref={inputRef}
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onFocus={handleOpen}
+            onKeyDown={handleKeyDown}
+            placeholder="Pin a product…"
+            className="text-sm text-stone-700 bg-white border border-stone-200 rounded-lg pl-8 pr-3 py-2 focus:outline-none focus:ring-1 focus:ring-stone-400 placeholder:text-stone-400 w-48"
+          />
+        </div>
+      )}
+
+      {open && !value && (
+        <div ref={listRef} className="absolute top-full left-0 mt-1 w-80 max-h-72 overflow-y-auto bg-white border border-stone-200 rounded-xl shadow-lg z-30">
+          {loading && results.length === 0 && (
+            <div className="px-3 py-4 text-xs text-stone-400 text-center">Loading…</div>
+          )}
+          {loading && results.length > 0 && (
+            <div className="px-3 py-1.5 text-[10px] text-stone-300 text-center bg-stone-50 border-b border-stone-100 sticky top-0">Updating…</div>
+          )}
+          {!loading && results.length === 0 && query && (
+            <div className="px-3 py-4 text-xs text-stone-400 text-center">No products match &ldquo;{query}&rdquo;</div>
+          )}
+          {!loading && results.length === 0 && !query && (
+            <div className="px-3 py-4 text-xs text-stone-400 text-center">No products found</div>
+          )}
+          {results.map((p, idx) => (
+            <button
+              key={p.id}
+              onClick={() => select(p)}
+              onMouseEnter={() => setHighlightIdx(idx)}
+              className={`flex items-center gap-3 w-full px-3 py-2 transition-colors text-left ${
+                idx === highlightIdx ? 'bg-stone-100' : 'hover:bg-stone-50'
+              }`}
+            >
+              {p.thumbnail ? (
+                <img src={p.thumbnail + '&width=64'} alt="" className="w-8 h-8 rounded object-cover shrink-0" />
+              ) : (
+                <div className="w-8 h-8 rounded bg-stone-100 shrink-0 flex items-center justify-center">
+                  <svg className="w-4 h-4 text-stone-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909M3.75 21h16.5A2.25 2.25 0 0022.5 18.75V5.25A2.25 2.25 0 0020.25 3H3.75A2.25 2.25 0 001.5 5.25v13.5A2.25 2.25 0 003.75 21z" />
+                  </svg>
+                </div>
+              )}
+              <div className="min-w-0 flex-1">
+                <div className="text-sm text-stone-700 truncate">{p.title}</div>
+                {p.productType && (
+                  <div className="text-xs text-stone-400 truncate">{p.productType}</div>
+                )}
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Tag chip input ───────────────────────────────────────────────────────────
 function TagInput({ tags, onChange, placeholder }) {
   const [input, setInput] = useState('');
@@ -795,6 +1409,8 @@ export default function Page() {
   const [error, setError] = useState(null);
   const [styleOptions, setStyleOptions] = useState([]);
   const [roomTypeOptions, setRoomTypeOptions] = useState([]);
+  const [combinationNames, setCombinationNames] = useState([]);
+  const [accessoriesList, setAccessoriesList] = useState([]);
   const [roomNameOptions, setRoomNameOptions] = useState([]);
   const [filters, setFilters] = useState({
     designStyle: '',
@@ -804,6 +1420,8 @@ export default function Page() {
     camera: '',
     count: '',
     productCount: 3,
+    featuredProducts: ['', '', ''],
+    pickedProduct: null,
   });
 
   // ── Hamburger menu ──────────────────────────────────────────────────────────
@@ -883,6 +1501,8 @@ export default function Page() {
         setStyleOptions(data.styles ?? []);
         setRoomTypeOptions(data.roomTypes ?? []);
         setRoomNameOptions(data.roomNames ?? []);
+        setCombinationNames(data.combinationNames ?? []);
+        setAccessoriesList(data.accessoriesList ?? []);
       })
       .catch(() => {});
   }, []);
@@ -892,11 +1512,11 @@ export default function Page() {
   }
 
   function clearFilters() {
-    setFilters({ designStyle: '', roomType: '', roomName: '', lighting: '', camera: '', count: '', productCount: 3 });
+    setFilters({ designStyle: '', roomType: '', roomName: '', lighting: '', camera: '', count: '', productCount: 3, featuredProducts: ['', '', ''], pickedProduct: null });
   }
 
   const hasActiveFilters =
-    !!(filters.designStyle || filters.roomType || filters.roomName || filters.lighting || filters.camera || filters.count) ||
+    !!(filters.designStyle || filters.roomType || filters.roomName || filters.lighting || filters.camera || filters.count || filters.pickedProduct || filters.featuredProducts.some(h => h)) ||
     filters.productCount !== 3;
 
   async function generate() {
@@ -905,8 +1525,14 @@ export default function Page() {
     setRooms([]);
 
     const activeFilters = Object.fromEntries(
-      Object.entries(filters).filter(([, v]) => String(v).trim())
+      Object.entries(filters).filter(([k, v]) => {
+        if (k === 'featuredProducts') return false; // handled below
+        return String(v).trim();
+      })
     );
+    const nonEmptyHandles = filters.featuredProducts.filter(h => h.trim());
+    if (filters.pickedProduct) nonEmptyHandles.push(filters.pickedProduct.handle);
+    if (nonEmptyHandles.length > 0) activeFilters.featuredProducts = nonEmptyHandles;
     if (mode !== 'standard') activeFilters.mode = mode;
 
     try {
@@ -1059,6 +1685,18 @@ export default function Page() {
                         />
                       </div>
 
+                      {/* How it works */}
+                      <div className="border-t border-stone-100 pt-4 space-y-2">
+                        <p className="text-[10px] font-semibold text-stone-500 uppercase tracking-wide">How room building works</p>
+                        <div className="text-[11px] text-stone-400 space-y-1.5 leading-relaxed">
+                          <p><span className="font-medium text-stone-500">1. Product pull:</span> All products matching the vendor, tag, and inventory filters above are fetched from Shopify. Products must also have a <code className="bg-stone-100 px-1 rounded text-[10px]">custom.design_style</code> metafield or they are skipped.</p>
+                          <p><span className="font-medium text-stone-500">2. Style grouping:</span> Products are grouped by their design style (e.g. Coastal, Modern). Each room is built from products that share a style.</p>
+                          <p><span className="font-medium text-stone-500">3. Combination matching:</span> Each room follows a product type combination from <code className="bg-stone-100 px-1 rounded text-[10px]">config.json</code> (e.g. &ldquo;Entryway&rdquo; = Console Tables + Mirrors + Table Lamps). The combo defines which <code className="bg-stone-100 px-1 rounded text-[10px]">productType</code> slots to fill. If no products exist for a required type in a given style, that combo is skipped.</p>
+                          <p><span className="font-medium text-stone-500">4. Scoring:</span> Multiple candidate sets are sampled, then scored by shared styles and materials between products. A top-tier set is picked randomly so rooms are cohesive but vary each run.</p>
+                          <p><span className="font-medium text-stone-500">5. Uniqueness:</span> Each product appears in at most one room per generate. Once assigned, it is excluded from subsequent rooms.</p>
+                        </div>
+                      </div>
+
                       {/* Save */}
                       {criteriaError && (
                         <p className="text-xs text-red-600">{criteriaError}</p>
@@ -1207,6 +1845,22 @@ export default function Page() {
         </div>
       )}
 
+      {/* Featured product banner */}
+      {(filters.featuredProducts.some(h => h) || filters.pickedProduct) && (
+        <div className="mb-6 px-4 py-3 bg-amber-50 border border-amber-200 rounded-xl flex items-center gap-3 text-sm text-amber-700">
+          <svg className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.784-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z" />
+          </svg>
+          <span>Featured product mode —{' '}
+            {filters.pickedProduct && (
+              <code className="font-mono text-xs bg-amber-100 px-1 py-0.5 rounded">{filters.pickedProduct.title}</code>
+            )}
+            {filters.featuredProducts.filter(h => h).map((h, i) => (
+              <span key={i}>{(i > 0 || filters.pickedProduct) && ', '}<code className="font-mono text-xs bg-amber-100 px-1 py-0.5 rounded">{h}</code></span>
+            ))} will appear in every generated room.</span>
+        </div>
+      )}
+
       {/* Filters */}
       <div className="mb-6 p-4 bg-white border border-stone-200 rounded-xl">
         <div className="flex flex-wrap items-center gap-3">
@@ -1262,6 +1916,30 @@ export default function Page() {
             placeholder="Camera override…"
             className={inputClass}
           />
+
+          <div className="flex items-center gap-2 ml-2 pl-3 border-l border-stone-200">
+            <span className="text-xs font-medium text-stone-500 uppercase tracking-wide whitespace-nowrap">
+              Featured
+            </span>
+            <ProductSearchPicker
+              value={filters.pickedProduct}
+              onChange={(p) => setFilter('pickedProduct', p)}
+            />
+            {filters.featuredProducts.map((handle, idx) => (
+              <input
+                key={`fp-${idx}`}
+                type="text"
+                value={handle}
+                onChange={(e) => {
+                  const next = [...filters.featuredProducts];
+                  next[idx] = e.target.value;
+                  setFilter('featuredProducts', next);
+                }}
+                placeholder={`Handle ${idx + 1}…`}
+                className={inputClass + ' w-36'}
+              />
+            ))}
+          </div>
 
           <div className="flex items-center gap-2 ml-2 pl-3 border-l border-stone-200">
             <span className="text-xs font-medium text-stone-500 uppercase tracking-wide whitespace-nowrap">
@@ -1347,7 +2025,7 @@ export default function Page() {
       {!loading && rooms.length > 0 && (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
           {rooms.map((room, i) => (
-            <RoomCard key={`${room.style}-${i}`} room={room} mode={mode} />
+            <RoomCard key={`${room.style}-${i}`} room={room} mode={mode} combinationNames={combinationNames} accessoriesList={accessoriesList} featuredProductHandles={[...filters.featuredProducts.filter(h => h.trim()), ...(filters.pickedProduct ? [filters.pickedProduct.handle] : [])]} />
           ))}
         </div>
       )}
