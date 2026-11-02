@@ -48,5 +48,8 @@ export async function GET() {
     } catch (_) {}
   }
 
-  return NextResponse.json({ styles, roomTypes, roomNames });
+  const combinationNames = config.productTypeCombinations.map((c) => c.name);
+  const accessoriesList = config.accessories || [];
+
+  return NextResponse.json({ styles, roomTypes, roomNames, combinationNames, accessoriesList });
 }

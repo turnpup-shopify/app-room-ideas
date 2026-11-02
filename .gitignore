@@ -13,5 +13,16 @@ node_modules/
 # Vercel
 .vercel/
 
+# Pinterest OAuth token
+pinterest-auth.json
+
+# Pins saved to post later (copy + downloaded images)
+pinterest-saved.json
+pinterest-posted.json
+saved-pins/
+
+# Uttermost daily inventory feed history (synced from the Apps Script archive)
+vendor-feed/
+
 # OS
 .DS_Store

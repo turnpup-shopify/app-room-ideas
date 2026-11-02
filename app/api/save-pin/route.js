@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { writeFile, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
+import { fetchCleanImage } from '../../../lib/cleanImage.js';
 
 const PINS_DIR = join(homedir(), 'Library', 'Mobile Documents', 'com~apple~CloudDocs', 'Pinterest', 'Htgt');
 
@@ -21,13 +22,8 @@ export async function POST(request) {
     // Ensure destination folder exists
     await mkdir(PINS_DIR, { recursive: true });
 
-    // Download image
-    const res = await fetch(imageUrl);
-    if (!res.ok) throw new Error(`Failed to download image: ${res.status}`);
-
-    const buffer = Buffer.from(await res.arrayBuffer());
-    const contentType = res.headers.get('content-type') || 'image/png';
-    const ext = contentType.includes('jpeg') || contentType.includes('jpg') ? 'jpg' : 'png';
+    // Download image and strip metadata
+    const { buffer, ext } = await fetchCleanImage(imageUrl);
 
     const safe = (filename || String(Date.now()))
       .toLowerCase()

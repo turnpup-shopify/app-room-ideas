@@ -2,6 +2,8 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import Image from 'next/image';
+import { parseHashtags, dedupeHashtags } from '../lib/hashtags.js';
+import { STYLE_NAMES } from '../lib/styleProfiles.js';
 
 // ─── Style badge colors ───────────────────────────────────────────────────────
 const STYLE_COLORS = {
@@ -59,6 +61,12 @@ function assemblePromptFromScene(scene, itemList) {
     }
     parts.push(sceneDesc);
   }
+  if (scene.design_style) {
+    parts.push(
+      `Design style: ${scene.design_style}. Render the architecture, finishes, decor, and accessories in ${scene.design_style} style; ` +
+      `where the scene description points to a different style, adapt it to ${scene.design_style} while keeping the room type and layout.`
+    );
+  }
   parts.push(`Featured products: a ${itemList}.`);
   parts.push(PRODUCT_FIDELITY_INSTRUCTION);
   if (scene.materials)                   parts.push(`Materials: ${scene.materials}.`);
@@ -95,6 +103,96 @@ function buildItemList(products, selectedIds) {
   return `${items.slice(0, -1).join(', ')}, and ${items[items.length - 1]}`;
 }
 
+// ─── Higgsfield generation queue ───────────────────────────────────────────────
+// Mirrors the server's 2-concurrent limit so extra clicks wait in line (and can be
+// cancelled) instead of all hitting /api/generate at once.
+const MAX_ACTIVE_GENERATIONS = 2;
+let activeGenerations = 0;
+const generationQueue = [];
+
+function pumpGenerationQueue() {
+  while (activeGenerations < MAX_ACTIVE_GENERATIONS && generationQueue.length) {
+    const job = generationQueue.shift();
+    activeGenerations++;
+    job.onStart?.();
+    job.task()
+      .then(job.resolve, job.reject)
+      .finally(() => { activeGenerations--; pumpGenerationQueue(); });
+  }
+}
+
+/** Queue an async generation task. Returns { promise, cancel }; cancel only works while still queued. */
+function queueGeneration(task, onStart) {
+  let job;
+  const promise = new Promise((resolve, reject) => { job = { task, onStart, resolve, reject }; });
+  generationQueue.push(job);
+  pumpGenerationQueue();
+  const cancel = () => {
+    const idx = generationQueue.indexOf(job);
+    if (idx === -1) return;
+    generationQueue.splice(idx, 1);
+    job.reject(Object.assign(new Error('Cancelled'), { cancelled: true }));
+  };
+  return { promise, cancel };
+}
+
+const IMAGE_FORMATS = [
+  { aspect: '1:1', label: 'Square', hint: 'Product gallery, Instagram' },
+  { aspect: '2:3', label: 'Pinterest', hint: 'Standard pin' },
+  { aspect: '4:5', label: 'Portrait', hint: 'Instagram feed, store' },
+  { aspect: '9:16', label: 'Reel', hint: 'Reels, Stories, TikTok' },
+];
+
+const PIN_TITLE_MAX = 100;
+
+// Appended to the prompt for a Pinterest 2:3 render when exactly one product is featured
+function singleProductPinFraming(productName) {
+  return 'FINAL FRAMING (overrides any earlier camera or room description):\n' +
+    `Crop the scene to the ${productName} only.\n` +
+    'Product fills 50 to 70 percent of frame height, fully visible.\n' +
+    'Keep only the wall and floor directly behind it\n' +
+    'and at most one supporting object.\n' +
+    'Treat every other furniture piece above as off camera.\n' +
+    '2:3 vertical. No wide shot.';
+}
+
+// Overlay looks, rotated so a batch doesn't repeat one template (pin guide section 6)
+const OVERLAY_STYLES = [
+  'Typography: a high-contrast editorial serif (Didot or Canela style), light weight, centered, two or three lines, over the calmest area in the top third (plain wall, sky, ceiling, or soft shadow).',
+  'Typography: a light, wide-tracked geometric sans, left aligned in the upper left corner, two lines, generous letter spacing, like a design magazine section opener.',
+  'Typography: a large italic serif in a refined display cut, right aligned in the upper right area, set over a plain wall, three short lines with tight leading.',
+  'Typography: a medium-weight modern grotesk stacked in three or four short lines down the upper left side, tight leading, set into the wall or window area like gallery signage.',
+];
+
+/** Index of an overlay style that differs from the last one used (remembered in localStorage). */
+function nextOverlayStyle() {
+  let last = -1;
+  try { last = Number(localStorage.getItem('pinOverlayStyle') ?? -1); } catch {}
+  const options = OVERLAY_STYLES.map((_, i) => i).filter((i) => i !== last);
+  const pick = options[Math.floor(Math.random() * options.length)];
+  try { localStorage.setItem('pinOverlayStyle', String(pick)); } catch {}
+  return pick;
+}
+
+// Appended to the prompt when the card's "Text overlay" box is checked
+function textOverlayInstructions(headline, styleIndex = 0) {
+  return 'TEXT OVERLAY (render this text on the image, styled like a luxury interiors magazine cover):\n' +
+    `Headline, spelled exactly, nothing added or removed: "${headline}"\n` +
+    'The photo stays full-bleed, edge to edge. Set the text directly on the photo, inside the scene. Compose the shot with negative space where the text sits so it has room.\n' +
+    `${OVERLAY_STYLES[styleIndex] ?? OVERLAY_STYLES[0]}\n` +
+    'Medium or light weight, not heavy or bold. Sentence case, as written above.\n' +
+    'Color: soft white or warm ivory over a darker area, or deep charcoal over a light area, picked from the scene\'s palette. ' +
+    'At most a faint, natural shadow or subtle gradient in the photo itself for legibility.\n' +
+    'Large enough to read on a phone at a glance, but elegant, not shouting.\n' +
+    'NEVER: white or colored bars, banners, header strips, boxes, frames, borders, letterboxing, or blank margins around the photo. ' +
+    'No heavy black Arial/Helvetica-style type, no outlines, no drop-shadow glow.\n' +
+    'Keep every letter out of the bottom 20 percent of the frame, where Pinterest\'s buttons sit.\n' +
+    'Do not cover the featured products. No other words, logos, or watermarks anywhere in the image.';
+}
+
+const PIN_DESCRIPTION_MAX = 500;
+const PIN_ALT_MAX = 500;
+
 // ─── Pinterest mode icon ──────────────────────────────────────────────────────
 function PinterestIcon({ className }) {
   return (
@@ -105,7 +203,7 @@ function PinterestIcon({ className }) {
 }
 
 // ─── RoomCard ─────────────────────────────────────────────────────────────────
-function RoomCard({ room, mode, combinationNames = [], accessoriesList = [], featuredProductHandles = [] }) {
+function RoomCard({ room, mode, combinationNames = [], accessoriesList = [], featuredProductHandles = [], pinterestConnected = false, pinterestBoard = null, pinterestBoards = [], onPinterestAuthError, onPinSavedForLater, pinLog = () => {} }) {
   const [prompt, setPrompt] = useState(room.prompt);
   const [scene, setScene] = useState(room.scene);
   const [sceneOpen, setSceneOpen] = useState(false);
@@ -137,15 +235,38 @@ function RoomCard({ room, mode, combinationNames = [], accessoriesList = [], fea
   const [genError, setGenError] = useState(null);
   const [publishing, setPublishing] = useState(false);
   const [published, setPublished] = useState(false);
+  const [publishedHandle, setPublishedHandle] = useState(null); // room handle from Shopify publish
+  const [publishedDescription, setPublishedDescription] = useState(null); // room description from Shopify publish, reused for pin copy
   const [publishError, setPublishError] = useState(null);
   const [linkWarning, setLinkWarning] = useState(null); // non-null = back-link errors
-  // Pinterest version (2:3) — used both by Pinterest mode and the standard-mode secondary button
-  const [pinImage, setPinImage] = useState(null);
-  const [generatingPin, setGeneratingPin] = useState(false);
-  const [pinGenError, setPinGenError] = useState(null);
+  // Image format: aspect of the current image, the one being created, and the picker menu
+  const [imageAspect, setImageAspect] = useState('2:3');
+  const [pendingAspect, setPendingAspect] = useState('2:3');
+  const [aspectMenuOpen, setAspectMenuOpen] = useState(false);
+  const [overlayOn, setOverlayOn] = useState(false);
+  const [overlayText, setOverlayText] = useState('');
+  const [overlayDrafting, setOverlayDrafting] = useState(false);
+  // Add a square image to one product's gallery: { [productId]: { adding, adminUrl, error } }
+  const [galleryProductId, setGalleryProductId] = useState('');
+  const [galleryStatus, setGalleryStatus] = useState({});
   const [savingPin, setSavingPin] = useState(false);
   const [pinSaved, setPinSaved] = useState(false);
   const [pinError, setPinError] = useState(null);
+  // Pinterest publish state
+  const [pinPosting, setPinPosting] = useState(false);
+  const [pinPosted, setPinPosted] = useState(null); // null or { pinUrl }
+  const [pinPostError, setPinPostError] = useState(null);
+  const [pinTokenPrompt, setPinTokenPrompt] = useState(false);
+  const [pinTokenInput, setPinTokenInput] = useState('');
+  const [pinTokenSaving, setPinTokenSaving] = useState(false);
+  // Generation queue state
+  const [genQueued, setGenQueued] = useState(false);
+  const genCancelRef = useRef(null);
+  // Pin review modal: null when closed
+  const [pinDraft, setPinDraft] = useState(null); // { imageUrl, title, body, hashtags, altText, link, boardId, library, loading, error }
+  const pinDraftStashRef = useRef(null); // last cancelled draft, restored if the same image is reopened
+  const [pinSavingForLater, setPinSavingForLater] = useState(false);
+  const [pinSavedForLater, setPinSavedForLater] = useState(false);
 
   const isPinterest = mode === 'pinterest';
 
@@ -272,7 +393,6 @@ function RoomCard({ room, mode, combinationNames = [], accessoriesList = [], fea
       setPublished(false);
       setPublishError(null);
       setLinkWarning(null);
-      setPinImage(null);
       setPinSaved(false);
     } catch (err) {
       console.error('Reshuffle failed:', err.message);
@@ -297,55 +417,123 @@ function RoomCard({ room, mode, combinationNames = [], accessoriesList = [], fea
     setTimeout(() => setCopied(false), 2000);
   }
 
-  async function generateImage() {
-    setGenerating(true);
-    setGenError(null);
-    setPinSaved(false);
-    setPinError(null);
+  // Queue a Higgsfield render. onQueued/onStart/onDone drive the card's button states.
+  async function runQueuedGeneration({ aspectRatio, headline, cancelRef, setQueued, setRunning, setError, onImage }) {
+    const selectedProducts = activeProducts.filter((p) => selectedIds.has(p.id));
+    const featuredHandles = featuredProductHandles.filter((h) => h.trim());
+    const featured = featuredHandles.length === 1 && selectedProducts.find((p) => p.handle === featuredHandles[0]);
+    const framedPrompt = [
+      prompt,
+      aspectRatio === '2:3' && featured && singleProductPinFraming(featured.title),
+      headline && textOverlayInstructions(headline, nextOverlayStyle()),
+    ].filter(Boolean).join('\n\n');
+    const body = JSON.stringify({
+      prompt: framedPrompt,
+      products: selectedProducts.map((p) => ({ title: p.title, images: p.images })),
+      aspectRatio,
+    });
+    setError(null);
+    setQueued(true);
+    const { promise, cancel } = queueGeneration(
+      async () => {
+        const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error ?? 'Generation failed');
+        return data.imageUrl;
+      },
+      () => { setQueued(false); setRunning(true); },
+    );
+    cancelRef.current = cancel;
     try {
-      const selectedProducts = activeProducts.filter((p) => selectedIds.has(p.id));
-      const res = await fetch('/api/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt,
-          products: selectedProducts.map((p) => ({ title: p.title, images: p.images })),
-          aspectRatio: isPinterest ? '2:3' : undefined,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? 'Generation failed');
-      setGeneratedImage(data.imageUrl);
+      onImage(await promise);
     } catch (err) {
-      setGenError(err.message);
+      if (!err.cancelled) setError(err.message);
     } finally {
-      setGenerating(false);
+      cancelRef.current = null;
+      setQueued(false);
+      setRunning(false);
     }
   }
 
-  async function generatePinVersion() {
-    setGeneratingPin(true);
-    setPinGenError(null);
-    setPinSaved(false);
-    setPinError(null);
+  // Draft the overlay headline (keyword + benefit or number) with Claude
+  async function draftOverlayHeadline() {
+    setOverlayDrafting(true);
     try {
-      const selectedProducts = activeProducts.filter((p) => selectedIds.has(p.id));
-      const res = await fetch('/api/generate', {
+      const res = await fetch('/api/pinterest/headline', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          prompt,
-          products: selectedProducts.map((p) => ({ title: p.title, images: p.images })),
-          aspectRatio: '2:3',
+          style: room.style,
+          roomType: scene?.room_type || combinationName,
+          products: activeProducts.filter((p) => selectedIds.has(p.id)).map((p) => ({ title: p.title, productType: p.productType })),
         }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? 'Generation failed');
-      setPinImage(data.imageUrl);
+      if (res.ok && data.headline) {
+        setOverlayText(data.headline);
+        return data.headline;
+      }
     } catch (err) {
-      setPinGenError(err.message);
+      console.warn('Overlay headline draft failed:', err.message);
     } finally {
-      setGeneratingPin(false);
+      setOverlayDrafting(false);
+    }
+  }
+
+  function toggleOverlay(on) {
+    setOverlayOn(on);
+    if (on && !overlayText.trim()) draftOverlayHeadline();
+  }
+
+  async function generateImage(aspect) {
+    setPinSaved(false);
+    setPinError(null);
+    setPendingAspect(aspect);
+    // A ticked overlay always gets text: wait for the draft if it isn't ready, else use the template headline
+    let headline = '';
+    if (overlayOn) {
+      headline = overlayText.trim() || (await draftOverlayHeadline())
+        || `${room.style} ${scene?.room_type || combinationName} Ideas That Actually Work`;
+      setOverlayText(headline);
+    }
+    return runQueuedGeneration({
+      aspectRatio: aspect,
+      headline,
+      cancelRef: genCancelRef,
+      setQueued: setGenQueued,
+      setRunning: setGenerating,
+      setError: setGenError,
+      onImage: (url) => {
+        setGeneratedImage(url);
+        setImageAspect(aspect);
+        setPinPosted(null);
+        setPinSavedForLater(false);
+        setPublished(false);
+        setGalleryStatus({});
+      },
+    });
+  }
+
+  async function addImageToProduct() {
+    const product = activeProducts.find((p) => p.id === galleryProductId);
+    if (!product) return;
+    setGalleryStatus((s) => ({ ...s, [product.id]: { adding: true } }));
+    try {
+      const res = await fetch('/api/products/add-image', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          imageUrl: generatedImage,
+          productId: product.id,
+          productTitle: product.title,
+          alt: `${product.title} in a ${room.style.toLowerCase()} ${combinationName.toLowerCase()}`,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? 'Adding image failed');
+      setGalleryStatus((s) => ({ ...s, [product.id]: { adminUrl: data.adminUrl } }));
+    } catch (err) {
+      setGalleryStatus((s) => ({ ...s, [product.id]: { error: err.message } }));
     }
   }
 
@@ -370,6 +558,8 @@ function RoomCard({ room, mode, combinationNames = [], accessoriesList = [], fea
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? 'Publish failed');
       setPublished(true);
+      if (data.handle) setPublishedHandle(data.handle);
+      if (data.description) setPublishedDescription(data.description);
       if (data.linkResult?.errors?.length > 0) {
         setLinkWarning(`Room published, but product back-links failed: ${data.linkResult.errors.join(' | ')}`);
       }
@@ -430,6 +620,179 @@ function RoomCard({ room, mode, combinationNames = [], accessoriesList = [], fea
     }
   }
 
+  // Open the review modal. Connection is checked on "Post now", so pins can be saved for later while disconnected.
+  function publishToPinterest(imageUrl) {
+    if (!imageUrl || pinPosting || pinPosted) return;
+    pinLog('info', 'Opening pin review');
+    return openPinEditor(imageUrl);
+  }
+
+  // Draft the pin copy and open the review modal
+  async function openPinEditor(imageUrl, { redraft = false } = {}) {
+    setPinPostError(null);
+    const stash = pinDraftStashRef.current;
+    if (!redraft && stash?.imageUrl === imageUrl) {
+      setPinDraft(stash);
+      return;
+    }
+    pinDraftStashRef.current = null;
+    setPinDraft({
+      imageUrl, title: '', body: '', hashtags: '', topics: '', pattern: null, warnings: [], altText: '',
+      link: '', boardId: pinterestBoard || '', suggestedBoard: null, library: [], loading: true, error: null,
+      products: activeProducts.filter((p) => selectedIds.has(p.id)).map((p) => ({ id: p.id, title: p.title, tag: true })),
+    });
+    try {
+      const selectedProducts = activeProducts.filter((p) => selectedIds.has(p.id));
+      const res = await fetch('/api/pinterest/copy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          imageUrl,
+          style: room.style,
+          roomType: scene?.room_type || combinationName,
+          scene,
+          products: selectedProducts.map((p) => ({ title: p.title, handle: p.handle, productType: p.productType, materials: p.materials, dimensions: p.dimensions })),
+          roomDescription: publishedDescription || undefined,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? 'Could not draft pin copy');
+      pinLog('info', `Drafted pin copy: "${data.title}"`, data);
+      setPinDraft((d) => d && ({
+        ...d,
+        title: data.title,
+        body: data.body ?? data.description,
+        hashtags: (data.hashtags ?? []).join(' '),
+        topics: (data.topics ?? []).join(', '),
+        pattern: data.pattern ?? null,
+        warnings: data.warnings ?? [],
+        altText: data.altText,
+        link: d.link || data.link || '', // hero product's page
+        boardId: data.boardId || d.boardId, // style + room board picked from the pin guide
+        suggestedBoard: data.board ?? null,
+        library: data.library ?? [],
+        loading: false,
+      }));
+    } catch (err) {
+      pinLog('error', `Pin copy draft failed: ${err.message}`);
+      setPinDraft((d) => d && ({ ...d, loading: false, error: err.message }));
+    }
+  }
+
+  function closePinEditor() {
+    pinDraftStashRef.current = pinDraft;
+    setPinDraft(null);
+    setPinPostError(null);
+  }
+
+  async function savePinForLater(draft) {
+    setPinSavingForLater(true);
+    setPinPostError(null);
+    try {
+      const res = await fetch('/api/pinterest/saved', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          imageUrl: draft.imageUrl,
+          roomName: `${room.style} ${combinationName}`,
+          title: draft.title,
+          body: draft.body,
+          hashtags: draft.hashtags,
+          topics: draft.topics,
+          pattern: draft.pattern,
+          altText: draft.altText,
+          link: draft.link,
+          boardId: draft.boardId,
+          tagProducts: draft.products ?? [],
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? 'Save failed');
+      pinLog('info', `Saved pin for later: "${draft.title}"`, data);
+      pinDraftStashRef.current = null;
+      setPinDraft(null);
+      setPinSavedForLater(true);
+      onPinSavedForLater?.();
+    } catch (err) {
+      pinLog('error', `Save for later failed: ${err.message}`);
+      setPinPostError(err.message);
+    } finally {
+      setPinSavingForLater(false);
+    }
+  }
+
+  async function doPublishPin(draft) {
+    setPinPosting(true);
+    setPinPostError(null);
+    try {
+      const description = pinDraftDescription(draft);
+      pinLog('info', `Publishing pin: "${draft.title}" board=${draft.boardId || 'default'}`, { title: draft.title, description, altText: draft.altText, link: draft.link, boardId: draft.boardId });
+
+      const res = await fetch('/api/pinterest/publish', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          imageUrl: draft.imageUrl,
+          title: draft.title.trim(),
+          description,
+          altText: draft.altText.trim(),
+          link: draft.link.trim(),
+          boardId: draft.boardId || undefined,
+          pattern: draft.pattern || undefined,
+          tagProducts: draft.products ?? [],
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        const code = pinErrorCode(data);
+        pinLog('error', `Publish failed: ${data.error}`, data);
+        setPinPostError(code);
+        if (code === '__auth__') {
+          setPinTokenPrompt(true);
+          onPinterestAuthError?.();
+        }
+        return; // modal stays open so the pin can still be saved for later
+      }
+      pinLog('info', `Pin created: ${data.pinUrl}`, data);
+      setPinPosted({ pinUrl: data.pinUrl, tagSummary: pinTagSummary(data.tagging) });
+      pinDraftStashRef.current = null;
+      setPinDraft(null);
+    } catch (err) {
+      pinLog('error', `Publish exception: ${err.message}`);
+      setPinPostError(err.message);
+    } finally {
+      setPinPosting(false);
+    }
+  }
+
+  async function saveTokenAndPublish(imageUrl) {
+    if (!pinTokenInput.trim()) return;
+    setPinTokenSaving(true);
+    setPinPostError(null);
+    pinLog('info', 'Saving manual token…');
+    try {
+      const res = await fetch('/api/pinterest/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ accessToken: pinTokenInput.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? 'Save failed');
+      if (!data.valid) throw new Error(data.reason || 'Token is invalid');
+      pinLog('info', `Token saved & validated: user=${data.username ?? '—'}`, data);
+      // Token saved — close prompt, refresh parent status, and publish
+      setPinTokenPrompt(false);
+      setPinTokenInput('');
+      if (onPinterestAuthError) onPinterestAuthError();
+      await openPinEditor(imageUrl);
+    } catch (err) {
+      pinLog('error', `Token save failed: ${err.message}`);
+      setPinPostError(err.message);
+    } finally {
+      setPinTokenSaving(false);
+    }
+  }
+
   async function syncToSheet() {
     if (!scene || typeof scene.rowIndex !== 'number') return;
     setSyncing(true);
@@ -459,20 +822,23 @@ function RoomCard({ room, mode, combinationNames = [], accessoriesList = [], fea
           <img
             src={generatedImage}
             alt={`Generated ${room.style} room scene`}
-            className="w-full aspect-square object-cover"
+            className="w-full object-cover"
+            style={{ aspectRatio: imageAspect.replace(':', '/') }}
           />
           <span className="absolute top-2 left-2 text-xs font-medium bg-violet-600 text-white px-2 py-0.5 rounded-full">
-            AI Generated
+            {IMAGE_FORMATS.find((f) => f.aspect === imageAspect)?.label ?? 'Image'} · {imageAspect}
           </span>
           <button
             onClick={async () => {
               try {
-                const res = await fetch(generatedImage);
+                // Download through the server so the file has its metadata stripped
+                const res = await fetch(`/api/clean-image?url=${encodeURIComponent(generatedImage)}`);
+                if (!res.ok) throw new Error(await res.text());
                 const blob = await res.blob();
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = `${room.style}-${combinationName}`.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.png';
+                a.download = `${room.style}-${combinationName}`.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '.jpg';
                 a.click();
                 URL.revokeObjectURL(url);
               } catch {
@@ -496,7 +862,7 @@ function RoomCard({ room, mode, combinationNames = [], accessoriesList = [], fea
             <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
             <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
           </svg>
-          <span className="text-sm text-violet-700 font-medium">Generating scene...</span>
+          <span className="text-sm text-violet-700 font-medium">Creating {pendingAspect} image…</span>
         </div>
       )}
 
@@ -1058,48 +1424,90 @@ function RoomCard({ room, mode, combinationNames = [], accessoriesList = [], fea
         >
           {downloading ? 'Packaging...' : 'Download ZIP'}
         </button>
-        <button
-          onClick={generateImage}
-          disabled={generating}
-          className="flex-1 text-sm font-medium py-2 rounded-lg bg-violet-600 text-white hover:bg-violet-500 disabled:opacity-50 disabled:cursor-wait transition-colors"
-        >
-          {generating ? 'Generating...' : generatedImage ? 'Regenerate' : 'Generate Image'}
-        </button>
+        <div className="relative flex-1 flex">
+          <button
+            onClick={() => (genQueued ? genCancelRef.current?.() : setAspectMenuOpen((o) => !o))}
+            disabled={generating}
+            title={genQueued ? 'Waiting for a free Higgsfield slot. Click to cancel.' : 'Choose a format and create an image'}
+            className={`flex-1 text-sm font-medium py-2 rounded-lg flex items-center justify-center gap-1 disabled:opacity-50 disabled:cursor-wait transition-colors ${
+              genQueued ? 'bg-violet-100 text-violet-700 hover:bg-violet-200' : 'bg-violet-600 text-white hover:bg-violet-500'
+            }`}
+          >
+            {generating
+              ? `Creating ${pendingAspect}…`
+              : genQueued
+                ? `Queued ${pendingAspect} · Cancel`
+                : generatedImage ? 'New Image' : 'Create Image'}
+            {!generating && !genQueued && (
+              <svg className={`w-3.5 h-3.5 transition-transform ${aspectMenuOpen ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+              </svg>
+            )}
+          </button>
+
+          {aspectMenuOpen && (
+            <>
+              <div className="fixed inset-0 z-10" onClick={() => setAspectMenuOpen(false)} />
+              <div className="absolute right-0 bottom-full mb-2 z-20 w-64 bg-white rounded-xl shadow-lg border border-stone-200 p-1.5">
+                {IMAGE_FORMATS.map((f) => (
+                  <button
+                    key={f.aspect}
+                    onClick={() => { setAspectMenuOpen(false); generateImage(f.aspect); }}
+                    className="w-full flex items-center gap-3 px-2.5 py-2 rounded-lg hover:bg-violet-50 text-left transition-colors"
+                  >
+                    <span className="w-7 h-9 flex items-center justify-center shrink-0">
+                      <span className="block border-2 border-violet-500 rounded-sm" style={{ aspectRatio: f.aspect.replace(':', '/'), height: '100%' }} />
+                    </span>
+                    <span className="flex-1">
+                      <span className="block text-sm font-medium text-stone-800">{f.label} <span className="text-stone-400 font-normal">{f.aspect.replace(':', '×')}</span></span>
+                      <span className="block text-[11px] text-stone-400">{f.hint}</span>
+                    </span>
+                  </button>
+                ))}
+                <div className="border-t border-stone-100 mt-1.5 pt-2 px-2.5 pb-1">
+                  <label className="flex items-center gap-2 text-sm font-medium text-stone-800 cursor-pointer">
+                    <input type="checkbox" checked={overlayOn} onChange={(e) => toggleOverlay(e.target.checked)} className="accent-violet-600" />
+                    Text overlay
+                  </label>
+                  <p className="text-[11px] text-stone-400 mt-0.5">Search phrase on the image, 3 to 7 words (e.g. “Warm modern living room idea”). Shows wherever this image is used.</p>
+                  {overlayOn && (
+                    <div className="mt-1.5 flex gap-1">
+                      <input
+                        type="text"
+                        value={overlayText}
+                        onChange={(e) => setOverlayText(e.target.value)}
+                        placeholder={overlayDrafting ? 'Drafting…' : 'Headline'}
+                        disabled={overlayDrafting}
+                        className="flex-1 min-w-0 text-xs text-stone-800 border border-stone-200 rounded-md px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-violet-400"
+                      />
+                      <button
+                        onClick={draftOverlayHeadline}
+                        disabled={overlayDrafting}
+                        title="Draft a new headline"
+                        className="text-xs text-violet-700 border border-violet-200 rounded-md px-2 hover:bg-violet-50 disabled:opacity-50"
+                      >
+                        ↻
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </>
+          )}
+        </div>
       </div>
+
+      {overlayOn && (
+        <p className="px-5 -mt-2 pb-3 text-[11px] text-violet-700">
+          Text overlay on: {overlayDrafting ? 'drafting headline…' : overlayText.trim() ? `“${overlayText.trim()}”` : 'headline drafts when you create the image'}
+        </p>
+      )}
 
       {/* Post-generate actions */}
       {generatedImage && (
         <div className="px-5 pb-4 flex flex-col gap-2">
-          {isPinterest ? (
+          {!isPinterest && (
             <>
-              {/* Save to Downloads */}
-              {pinError && (
-                <p className="text-xs text-red-600">{pinError}</p>
-              )}
-              <button
-                onClick={() => savePin(generatedImage)}
-                disabled={savingPin || pinSaved}
-                className={`w-full text-sm font-medium py-2 rounded-lg transition-colors ${
-                  pinSaved
-                    ? 'bg-green-100 text-green-800 cursor-default'
-                    : 'bg-stone-900 text-white hover:bg-stone-700 disabled:opacity-50 disabled:cursor-wait'
-                }`}
-              >
-                {pinSaved ? 'Saved to Downloads' : savingPin ? 'Saving…' : 'Save to Downloads'}
-              </button>
-              {/* Pinterest — coming soon */}
-              <button
-                disabled
-                title="Pinterest API keys not configured yet"
-                className="w-full text-sm font-medium py-2 rounded-lg bg-rose-50 text-rose-400 border border-rose-200 cursor-not-allowed flex items-center justify-center gap-2"
-              >
-                <PinterestIcon className="w-4 h-4" />
-                Publish to Pinterest (coming soon)
-              </button>
-            </>
-          ) : (
-            <>
-              {/* Publish to Shopify */}
               {publishError && (
                 <p className="text-xs text-red-600">{publishError}</p>
               )}
@@ -1117,73 +1525,980 @@ function RoomCard({ room, mode, combinationNames = [], accessoriesList = [], fea
               >
                 {published ? 'Published' : publishing ? 'Publishing...' : 'Publish to Store'}
               </button>
-
-              {/* Pinterest 2:3 version */}
-              <div className="pt-2 border-t border-stone-100">
-                <p className="text-xs font-medium text-stone-400 uppercase tracking-wide mb-2 flex items-center gap-1.5">
-                  <PinterestIcon className="w-3 h-3" />
-                  Pinterest version (2:3)
-                </p>
-
-                {/* 2:3 image preview */}
-                {pinImage && (
-                  <div className="mb-2 rounded-lg overflow-hidden" style={{ aspectRatio: '2/3' }}>
-                    <img src={pinImage} alt="Pinterest 2:3 version" className="w-full h-full object-cover" />
-                  </div>
-                )}
-
-                {/* Generating spinner */}
-                {generatingPin && (
-                  <div className="flex items-center justify-center gap-2 py-3 bg-rose-50 rounded-lg mb-2">
-                    <svg className="animate-spin h-4 w-4 text-rose-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                    </svg>
-                    <span className="text-xs text-rose-600">Generating 2:3…</span>
-                  </div>
-                )}
-                {pinGenError && <p className="text-xs text-red-600 mb-2">{pinGenError}</p>}
-
-                <div className="flex gap-2">
-                  <button
-                    onClick={generatePinVersion}
-                    disabled={generatingPin}
-                    className="flex-1 text-sm font-medium py-2 rounded-lg border border-rose-300 text-rose-700 hover:bg-rose-50 disabled:opacity-50 disabled:cursor-wait transition-colors flex items-center justify-center gap-1.5"
-                  >
-                    <PinterestIcon className="w-3.5 h-3.5" />
-                    {generatingPin ? 'Generating…' : pinImage ? 'Regenerate 2:3' : 'Create 2:3'}
-                  </button>
-
-                  {pinImage && (
-                    <>
-                      <button
-                        onClick={() => savePin(pinImage)}
-                        disabled={savingPin || pinSaved}
-                        className={`flex-1 text-sm font-medium py-2 rounded-lg transition-colors ${
-                          pinSaved
-                            ? 'bg-green-100 text-green-800 cursor-default'
-                            : 'bg-stone-800 text-white hover:bg-stone-700 disabled:opacity-50 disabled:cursor-wait'
-                        }`}
-                      >
-                        {pinSaved ? 'Saved' : savingPin ? 'Saving…' : 'Save Pin'}
-                      </button>
-                      {pinError && <p className="text-xs text-red-600">{pinError}</p>}
-                      <button
-                        disabled
-                        title="Pinterest API keys not configured yet"
-                        className="flex-1 text-sm font-medium py-2 rounded-lg bg-rose-50 text-rose-400 border border-rose-200 cursor-not-allowed flex items-center justify-center gap-1.5"
-                      >
-                        <PinterestIcon className="w-3.5 h-3.5" />
-                        Post
-                      </button>
-                    </>
-                  )}
-                </div>
-              </div>
+              <div className="border-t border-stone-100 my-1" />
             </>
+          )}
+          {/* Square images can go back into a product's own gallery */}
+          {imageAspect === '1:1' && (() => {
+            const galleryProducts = activeProducts.filter((p) => selectedIds.has(p.id));
+            const current = galleryStatus[galleryProductId] ?? {};
+            return (
+              <div className="flex flex-col gap-1.5">
+                <label className="text-xs font-medium text-stone-500">Add to a product's image gallery (optional)</label>
+                <div className="flex gap-2">
+                  <select
+                    value={galleryProductId}
+                    onChange={(e) => setGalleryProductId(e.target.value)}
+                    className="flex-1 min-w-0 text-sm text-stone-700 border border-stone-200 rounded-lg px-2 py-2 bg-white focus:outline-none focus:ring-1 focus:ring-green-400"
+                  >
+                    <option value="">Choose a product…</option>
+                    {galleryProducts.map((p) => (
+                      <option key={p.id} value={p.id}>{galleryStatus[p.id]?.adminUrl ? '✓ ' : ''}{p.title}</option>
+                    ))}
+                  </select>
+                  <button
+                    onClick={addImageToProduct}
+                    disabled={!galleryProductId || current.adding || !!current.adminUrl}
+                    className="shrink-0 text-sm font-medium px-3 py-2 rounded-lg bg-green-600 text-white hover:bg-green-500 disabled:opacity-50 transition-colors"
+                  >
+                    {current.adding ? 'Adding…' : current.adminUrl ? 'Added' : 'Add Image'}
+                  </button>
+                </div>
+                {current.error && <p className="text-xs text-red-600">{current.error}</p>}
+                {current.adminUrl && (
+                  <a href={current.adminUrl} target="_blank" rel="noopener noreferrer" className="text-xs text-green-700 hover:underline">
+                    Added as the last image in the gallery. View in Shopify admin
+                  </a>
+                )}
+              </div>
+            );
+          })()}
+          {/* Save to Downloads */}
+          {pinError && (
+            <p className="text-xs text-red-600">{pinError}</p>
+          )}
+          <button
+            onClick={() => savePin(generatedImage)}
+            disabled={savingPin || pinSaved}
+            className={`w-full text-sm font-medium py-2 rounded-lg transition-colors ${
+              pinSaved
+                ? 'bg-green-100 text-green-800 cursor-default'
+                : 'bg-stone-900 text-white hover:bg-stone-700 disabled:opacity-50 disabled:cursor-wait'
+            }`}
+          >
+            {pinSaved ? 'Saved to Downloads' : savingPin ? 'Saving…' : 'Save to Downloads'}
+          </button>
+          {/* Publish to Pinterest */}
+          {pinPostError && !['__auth__', '__scope__', '__trial__'].includes(pinPostError) && (
+            <p className="text-xs text-red-600">{pinPostError}</p>
+          )}
+          {/* Trial error — app not approved for production writes */}
+          {pinPostError === '__trial__' && (
+            <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-2">
+              <p className="text-xs text-amber-800 font-medium">Pinterest app is in Trial mode</p>
+              <p className="text-[10px] text-amber-700">Trial apps can only create pins on the sandbox API. To publish to real boards, submit your app for review in the Pinterest developer dashboard to get Standard access.</p>
+              <button onClick={() => setPinPostError(null)} className="text-[10px] text-stone-400 hover:text-stone-600">Dismiss</button>
+            </div>
+          )}
+          {/* Scope error — token works but is read-only */}
+          {pinPostError === '__scope__' && (
+            <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-2">
+              <p className="text-xs text-amber-800 font-medium">Token is read-only — missing write permissions</p>
+              <p className="text-[10px] text-amber-700">The Pinterest developer dashboard only generates read-only tokens. To publish pins, connect via OAuth in the menu (hamburger → Pinterest → Connect to Pinterest).</p>
+              <button onClick={() => setPinPostError(null)} className="text-[10px] text-stone-400 hover:text-stone-600">Dismiss</button>
+            </div>
+          )}
+          {/* Auth error — token expired or missing */}
+          {pinTokenPrompt && (
+            <div className="bg-rose-50 border border-rose-200 rounded-lg p-3 space-y-2">
+              <p className="text-xs text-rose-700">{pinPostError === '__auth__' ? 'Token expired — paste a new one or reconnect via OAuth in the menu.' : 'Paste your Pinterest access token to publish.'}</p>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={pinTokenInput}
+                  onChange={(e) => { setPinTokenInput(e.target.value); setPinPostError(null); }}
+                  placeholder="pina_…"
+                  className="flex-1 text-xs text-stone-700 bg-white border border-stone-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-rose-400 font-mono placeholder:text-stone-400"
+                />
+                <button
+                  onClick={() => saveTokenAndPublish(generatedImage)}
+                  disabled={pinTokenSaving || !pinTokenInput.trim()}
+                  className="shrink-0 text-xs font-medium px-3 py-2 rounded-lg bg-rose-600 text-white hover:bg-rose-500 disabled:opacity-50 transition-colors"
+                >
+                  {pinTokenSaving ? 'Saving…' : 'Save & Publish'}
+                </button>
+              </div>
+              <button onClick={() => { setPinTokenPrompt(false); setPinPostError(null); }} className="text-[10px] text-stone-400 hover:text-stone-600">Cancel</button>
+            </div>
+          )}
+          {!pinTokenPrompt && pinPostError !== '__scope__' && (
+            <button
+              onClick={() => publishToPinterest(generatedImage)}
+              disabled={pinPosting || !!pinPosted}
+              className={`w-full text-sm font-medium py-2 rounded-lg flex items-center justify-center gap-2 transition-colors ${
+                pinPosted
+                  ? 'bg-green-100 text-green-800 cursor-default'
+                  : 'bg-rose-600 text-white hover:bg-rose-500 disabled:opacity-50 disabled:cursor-wait'
+              }`}
+            >
+              <PinterestIcon className="w-4 h-4" />
+              {pinPosted ? 'Published to Pinterest' : pinPosting ? 'Publishing…' : 'Publish to Pinterest'}
+            </button>
+          )}
+          {pinPosted && (
+            <a href={pinPosted.pinUrl} target="_blank" rel="noopener noreferrer" className="text-xs text-rose-600 hover:underline text-center">
+              View pin on Pinterest
+            </a>
+          )}
+          {pinPosted?.tagSummary && (
+            <p className="text-xs text-stone-500 text-center">{pinPosted.tagSummary}</p>
+          )}
+          {pinSavedForLater && !pinPosted && (
+            <p className="text-xs text-stone-500 text-center">Saved for later. Find it in ☰ → Saved Pins.</p>
           )}
         </div>
       )}
+
+      {/* Pin review modal */}
+      {pinDraft && (
+        <PinReviewModal
+          draft={pinDraft}
+          onChange={setPinDraft}
+          boards={pinterestBoards}
+          busy={pinPosting ? 'posting' : pinSavingForLater ? 'saving' : null}
+          error={pinErrorText(pinPostError)}
+          onClose={closePinEditor}
+          onRedraft={() => openPinEditor(pinDraft.imageUrl, { redraft: true })}
+          onPost={() => doPublishPin(pinDraft)}
+          onSave={() => savePinForLater(pinDraft)}
+          saveLabel="Save for later"
+        />
+      )}
+    </div>
+  );
+}
+
+// ─── Pin review modal (shared by room cards and the Saved Pins menu) ─────────
+
+function pinDraftDescription(draft) {
+  return [draft.body.trim(), draft.hashtags.trim()].filter(Boolean).join('\n\n');
+}
+
+/** Human message for a pin post error (codes come from classifyPinError on the server). */
+function pinErrorText(code) {
+  if (!code) return null;
+  if (code === '__trial__') return 'The Pinterest app is in Trial mode and can only post to the sandbox. Save the pin for later until the app is approved.';
+  if (code === '__scope__') return 'The Pinterest token is read-only. Reconnect via OAuth (menu → Pinterest), or save the pin for later.';
+  if (code === '__auth__') return 'Pinterest is not connected or the session expired. Reconnect in the menu (☰ → Pinterest), or save the pin for later.';
+  return code;
+}
+
+/** One-line summary of product tagging after a post, or null if nothing was requested. */
+function pinTagSummary(tagging) {
+  if (!tagging) return null;
+  const parts = [];
+  if (tagging.tagged?.length) parts.push(`Tagged ${tagging.tagged.length} product${tagging.tagged.length === 1 ? '' : 's'}`);
+  if (tagging.notInCatalog?.length) parts.push(`not in your Pinterest catalog: ${tagging.notInCatalog.join(', ')}`);
+  if (tagging.ineligible?.length) parts.push(`not taggable: ${tagging.ineligible.map((i) => `${i.title} (${i.reason})`).join(', ')}`);
+  if (tagging.error) parts.push(`product tagging failed: ${tagging.error}`);
+  return parts.length ? parts.join('; ') + '.' : null;
+}
+
+/** Map a failed post response to an error code for pinErrorText. */
+function pinErrorCode(data) {
+  if (data.trialError) return '__trial__';
+  if (data.scopeError) return '__scope__';
+  if (data.authError) return '__auth__';
+  return data.error ?? 'Pinterest publish failed';
+}
+
+function PinReviewModal({ draft, onChange, boards = [], busy, error, onClose, onRedraft, onPost, onSave, saveLabel }) {
+  const set = (key) => (e) => onChange((d) => ({ ...d, [key]: e.target.value }));
+  const description = pinDraftDescription(draft);
+  const overLimit = draft.title.length > PIN_TITLE_MAX || description.length > PIN_DESCRIPTION_MAX || draft.altText.length > PIN_ALT_MAX;
+  const blocked = draft.loading || !!busy || overLimit;
+
+  // Which products can be tagged: null while checking, Set of in-catalog IDs, or { error }
+  const [catalog, setCatalog] = useState(null);
+  const productIds = (draft.products ?? []).map((p) => p.id).join(',');
+  useEffect(() => {
+    if (!productIds) return;
+    let cancelled = false;
+    fetch('/api/pinterest/catalog-check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: productIds.split(',') }),
+    })
+      .then((r) => r.json())
+      .then((data) => !cancelled && setCatalog(data.error ? { error: data.error } : new Set(data.inCatalog)))
+      .catch((err) => !cancelled && setCatalog({ error: err.message }));
+    return () => { cancelled = true; };
+  }, [productIds]);
+
+  function toggleHashtag(tag) {
+    onChange((d) => {
+      const tags = d.hashtags.split(/\s+/).filter(Boolean);
+      const has = tags.some((t) => t.toLowerCase() === tag.toLowerCase());
+      const next = has ? tags.filter((t) => t.toLowerCase() !== tag.toLowerCase()) : [...tags, tag];
+      return { ...d, hashtags: next.join(' ') };
+    });
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-stone-900/50" onClick={() => !busy && onClose()} />
+      <div className="relative bg-white rounded-2xl shadow-xl w-full max-w-3xl max-h-[90vh] overflow-y-auto flex flex-col sm:flex-row">
+        {/* Image preview */}
+        <div className="sm:w-64 shrink-0 bg-stone-100 p-4 flex items-start justify-center">
+          <img src={draft.imageUrl} alt={draft.altText || 'Pin image'} className="w-full max-w-[220px] sm:max-w-none rounded-lg" />
+        </div>
+
+        {/* Fields */}
+        <div className="flex-1 p-5 space-y-4">
+          <div className="flex items-center justify-between">
+            <h3 className="text-base font-semibold text-stone-800 flex items-center gap-2">
+              <PinterestIcon className="w-4 h-4 text-rose-600" />
+              Review pin
+            </h3>
+            {onRedraft && (
+              <button onClick={onRedraft} disabled={draft.loading || !!busy} className="text-xs text-rose-600 hover:underline disabled:opacity-50">
+                {draft.loading ? 'Drafting…' : 'Redraft copy'}
+              </button>
+            )}
+          </div>
+
+          {draft.error && <p className="text-xs text-red-600">Drafting failed: {draft.error}. You can still write the copy yourself.</p>}
+
+          {draft.warnings?.length > 0 && (
+            <ul className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 space-y-1 list-disc list-inside">
+              {draft.warnings.map((w) => <li key={w}>{w}</li>)}
+            </ul>
+          )}
+
+          <fieldset disabled={draft.loading || !!busy} className={`space-y-4 ${draft.loading ? 'opacity-50' : ''}`}>
+            <PinField label="Title" value={draft.title} max={PIN_TITLE_MAX}>
+              <input
+                type="text"
+                value={draft.title}
+                onChange={set('title')}
+                className="w-full text-sm text-stone-800 border border-stone-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-rose-400"
+              />
+            </PinField>
+
+            <PinField label="Description" value={description} max={PIN_DESCRIPTION_MAX} hint="Counts description + hashtags together">
+              <textarea
+                value={draft.body}
+                onChange={set('body')}
+                rows={5}
+                className="w-full text-sm text-stone-800 border border-stone-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-rose-400 resize-y"
+              />
+            </PinField>
+
+            <div>
+              <label className="block text-xs font-medium text-stone-500 mb-1.5">Hashtags</label>
+              <input
+                type="text"
+                value={draft.hashtags}
+                onChange={set('hashtags')}
+                className="w-full text-sm text-rose-700 font-mono border border-stone-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-rose-400"
+              />
+              {draft.library?.length > 0 && (
+                <div className="flex flex-wrap gap-1 mt-2 max-h-24 overflow-y-auto">
+                  {draft.library.map((tag) => {
+                    const on = draft.hashtags.split(/\s+/).some((t) => t.toLowerCase() === tag.toLowerCase());
+                    return (
+                      <button
+                        key={tag}
+                        type="button"
+                        onClick={() => toggleHashtag(tag)}
+                        className={`text-[11px] rounded-full px-2 py-0.5 border transition-colors ${
+                          on ? 'bg-rose-600 border-rose-600 text-white' : 'bg-white border-stone-200 text-stone-500 hover:border-rose-300'
+                        }`}
+                      >
+                        {tag}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-stone-500 mb-1.5">Topic tags</label>
+              <textarea
+                value={draft.topics ?? ''}
+                onChange={set('topics')}
+                rows={2}
+                className="w-full text-sm text-stone-800 border border-stone-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-rose-400 resize-y"
+              />
+              <p className="text-[10px] text-stone-400 mt-1">Pinterest's API can't set topic tags. Add these to the pin in Pinterest after posting.</p>
+            </div>
+
+            <PinField label="Alt text" value={draft.altText} max={PIN_ALT_MAX}>
+              <textarea
+                value={draft.altText}
+                onChange={set('altText')}
+                rows={2}
+                className="w-full text-sm text-stone-800 border border-stone-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-rose-400 resize-y"
+              />
+            </PinField>
+
+            {draft.products?.length > 0 && (
+              <div>
+                <label className="block text-xs font-medium text-stone-500 mb-1.5">Tag products</label>
+                <div className="space-y-1">
+                  {draft.products.map((p) => (
+                    <label key={p.id} className="flex items-center gap-2 text-sm text-stone-700 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={p.tag !== false}
+                        onChange={(e) => onChange((d) => ({
+                          ...d,
+                          products: d.products.map((x) => (x.id === p.id ? { ...x, tag: e.target.checked } : x)),
+                        }))}
+                        className="accent-rose-600"
+                      />
+                      <span className="truncate">{p.title}</span>
+                      {catalog instanceof Set && (catalog.has(p.id)
+                        ? <span className="shrink-0 text-[10px] text-emerald-600">In catalog</span>
+                        : <span className="shrink-0 text-[10px] text-amber-600">Not in Pinterest catalog, won't tag</span>)}
+                    </label>
+                  ))}
+                </div>
+                <p className="text-[10px] text-stone-400 mt-1">
+                  {catalog === null ? 'Checking your Pinterest catalog…'
+                    : catalog.error ? `Couldn't check the catalog: ${catalog.error}`
+                    : 'Tagged after posting, using each product\'s pin from your Pinterest catalog. Products appear there once they are published to the Pinterest sales channel in Shopify and the catalog syncs.'}
+                </p>
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-stone-500 mb-1.5">Website</label>
+                <input
+                  type="url"
+                  value={draft.link}
+                  onChange={set('link')}
+                  placeholder="https://htgtfurniture.com/products/…"
+                  className="w-full text-sm text-stone-800 border border-stone-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-rose-400"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-stone-500 mb-1.5">Board</label>
+                <select
+                  value={draft.boardId}
+                  onChange={set('boardId')}
+                  className="w-full text-sm text-stone-800 bg-white border border-stone-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-rose-400"
+                >
+                  <option value="">Default board</option>
+                  {boards.map((b) => (
+                    <option key={b.id} value={b.id}>{b.name}</option>
+                  ))}
+                </select>
+                {draft.suggestedBoard && !boards.some((b) => b.name === draft.suggestedBoard) && (
+                  <p className="text-[10px] text-amber-600 mt-1">Suggested board “{draft.suggestedBoard}” isn't on your account yet.</p>
+                )}
+              </div>
+            </div>
+          </fieldset>
+
+          {error && <p className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{error}</p>}
+
+          <div className="flex flex-col sm:flex-row gap-2 pt-1">
+            <button
+              onClick={onClose}
+              disabled={!!busy}
+              className="sm:flex-1 text-sm font-medium py-2 rounded-lg border border-stone-300 hover:bg-stone-100 disabled:opacity-50 transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={onSave}
+              disabled={blocked}
+              className="sm:flex-1 text-sm font-medium py-2 rounded-lg bg-stone-800 text-white hover:bg-stone-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              {busy === 'saving' ? 'Saving…' : saveLabel}
+            </button>
+            <button
+              onClick={onPost}
+              disabled={blocked || !draft.title.trim()}
+              className="sm:flex-1 text-sm font-medium py-2 rounded-lg bg-rose-600 text-white hover:bg-rose-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2"
+            >
+              <PinterestIcon className="w-4 h-4" />
+              {busy === 'posting' ? 'Posting…' : 'Post now'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Labeled field with a live character count against Pinterest's limit
+// ─── Pin suggestions (☰ → Pin Suggestions) ───────────────────────────────────
+
+function formatPinAge(iso) {
+  if (!iso) return 'Never pinned';
+  const days = Math.floor((Date.now() - new Date(iso).getTime()) / 86400000);
+  if (days < 1) return 'Pinned today';
+  if (days < 60) return `Pinned ${days}d ago`;
+  if (days < 730) return `Pinned ${Math.round(days / 30)} mo ago`;
+  return `Pinned ${Math.floor(days / 365)} yr ago`;
+}
+
+function PinSuggestionsModal({ state, onClose, onRefresh, onMakeRoom }) {
+  const [tab, setTab] = useState('rooms');
+  const [typeFilter, setTypeFilter] = useState('');
+  const [hideRecent, setHideRecent] = useState(true);
+  const { loading, error, data } = state;
+
+  const types = data ? [...new Set(data.products.map((p) => p.productType).filter(Boolean))].sort() : [];
+  const recentCutoff = Date.now() - 90 * 86400000;
+  const products = (data?.products ?? []).filter((p) =>
+    (!typeFilter || p.productType === typeFilter) &&
+    (!hideRecent || !p.lastPinnedAt || new Date(p.lastPinnedAt).getTime() < recentCutoff));
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-stone-900/50" onClick={onClose} />
+      <div className="relative bg-white rounded-2xl shadow-xl w-full max-w-4xl max-h-[90vh] flex flex-col">
+        <div className="px-5 pt-5 pb-3 border-b border-stone-100">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <h2 className="text-lg font-semibold text-stone-900">Pin Suggestions</h2>
+              <p className="text-xs text-stone-500 mt-0.5">
+                In-stock products ranked by time since last pin, stock, sales, and what earns saves and clicks on your Pinterest (last 90 days).
+              </p>
+            </div>
+            <button onClick={onClose} className="text-stone-400 hover:text-stone-700" aria-label="Close">✕</button>
+          </div>
+
+          {data && (
+            <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-xs text-stone-600">
+              <span><b className="text-stone-900">{data.summary.neverPinned}</b> of {data.summary.inStock} in-stock products never pinned</span>
+              <span><b className="text-stone-900">{data.summary.pinnedLast90}</b> pinned in the last 90 days</span>
+              {data.summary.topTypes[0] && (
+                <span>Best type: <b className="text-stone-900">{data.summary.topTypes[0].type}</b> ({data.summary.topTypes[0].saves} saves, {data.summary.topTypes[0].clicks} clicks)</span>
+              )}
+            </div>
+          )}
+
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            {[['rooms', `Suggested rooms${data ? ` (${data.rooms.length})` : ''}`], ['products', 'Products']].map(([key, label]) => (
+              <button
+                key={key}
+                onClick={() => setTab(key)}
+                className={`text-xs font-medium px-3 py-1.5 rounded-full transition-colors ${tab === key ? 'bg-stone-900 text-white' : 'bg-stone-100 text-stone-600 hover:bg-stone-200'}`}
+              >
+                {label}
+              </button>
+            ))}
+            {tab === 'products' && data && (
+              <>
+                <select
+                  value={typeFilter}
+                  onChange={(e) => setTypeFilter(e.target.value)}
+                  className="text-xs text-stone-700 border border-stone-200 rounded-full px-2.5 py-1.5 bg-white"
+                >
+                  <option value="">All types</option>
+                  {types.map((t) => <option key={t} value={t}>{t}</option>)}
+                </select>
+                <label className="flex items-center gap-1.5 text-xs text-stone-600 cursor-pointer">
+                  <input type="checkbox" checked={hideRecent} onChange={(e) => setHideRecent(e.target.checked)} className="accent-stone-900" />
+                  Hide pinned in last 90 days
+                </label>
+              </>
+            )}
+            <button onClick={onRefresh} disabled={loading} className="ml-auto text-xs text-stone-500 hover:text-stone-800 disabled:opacity-50">
+              {loading ? 'Loading…' : 'Refresh'}
+            </button>
+          </div>
+        </div>
+
+        <div className="overflow-y-auto px-5 py-4 flex-1">
+          {loading && !data && (
+            <p className="text-sm text-stone-500 py-10 text-center">Reading your pins, Pinterest analytics, and Shopify stock and sales. This takes about 15 seconds.</p>
+          )}
+          {error && <p className="text-sm text-red-600 mb-3">{error}</p>}
+          {data?.warnings?.map((w) => <p key={w} className="text-xs text-amber-700 mb-2">{w}</p>)}
+
+          {data && tab === 'rooms' && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {data.rooms.length === 0 && <p className="text-sm text-stone-400 italic">No rooms could be built from unpinned products.</p>}
+              {data.rooms.map((room) => (
+                <div key={`${room.style}-${room.combination}-${room.products[0].id}`} className="border border-stone-200 rounded-xl p-3 flex flex-col gap-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-sm font-medium text-stone-800">{room.style} · {room.combination}</span>
+                    <span className="text-[10px] text-stone-400">score {room.score}</span>
+                  </div>
+                  <div className="flex gap-2">
+                    {room.products.map((p) => (
+                      <div key={p.id} className="flex-1 min-w-0">
+                        {p.thumbnail
+                          ? <img src={p.thumbnail} alt={p.title} className="w-full aspect-square object-cover rounded-lg bg-stone-100" />
+                          : <div className="w-full aspect-square rounded-lg bg-stone-100" />}
+                        <p className="text-[10px] text-stone-600 mt-1 line-clamp-2">{p.title}</p>
+                      </div>
+                    ))}
+                  </div>
+                  <button
+                    onClick={() => onMakeRoom(room.products)}
+                    className="text-xs font-medium py-2 rounded-lg bg-violet-600 text-white hover:bg-violet-500 transition-colors"
+                  >
+                    Make this room
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {data && tab === 'products' && (
+            <div className="divide-y divide-stone-100">
+              {products.length === 0 && <p className="text-sm text-stone-400 italic py-4">No products match.</p>}
+              {products.map((p) => (
+                <div key={p.id} className="flex items-center gap-3 py-2.5">
+                  {p.thumbnail
+                    ? <img src={p.thumbnail} alt={p.title} className="w-12 h-12 object-cover rounded-md bg-stone-100 shrink-0" />
+                    : <div className="w-12 h-12 rounded-md bg-stone-100 shrink-0" />}
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm text-stone-800 truncate">{p.title}</p>
+                    <p className="text-[11px] text-stone-500 truncate">
+                      {p.productType || 'No type'} · {formatPinAge(p.lastPinnedAt)}{p.pinCount > 1 ? ` (${p.pinCount} pins)` : ''}
+                    </p>
+                    <p className="text-[11px] text-stone-400 truncate">{p.reasons.filter((r) => !r.startsWith('Never pinned') && !r.startsWith('Last pinned')).join(' · ')}</p>
+                  </div>
+                  <span className="text-xs font-medium text-stone-500 w-8 text-right shrink-0" title="Suggestion score (0–100)">{p.score}</span>
+                  <button
+                    onClick={() => onMakeRoom([p])}
+                    disabled={!p.roomReady}
+                    title={p.roomReady ? 'Generate rooms featuring this product' : 'Needs a design style (custom.design_style) before it can be used in rooms'}
+                    className="shrink-0 text-xs font-medium px-3 py-1.5 rounded-lg bg-violet-600 text-white hover:bg-violet-500 disabled:bg-stone-200 disabled:text-stone-500 transition-colors"
+                  >
+                    {p.roomReady ? 'Make a room' : 'No style'}
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Add scene from a photo (☰ → Add Scene) ──────────────────────────────────
+// Ported from htgtprompts2026's /add-room: Claude reads a room photo into scene sheet
+// columns (/api/scenes/analyze), you edit them, and /api/scenes/add appends the row.
+
+const ADD_SCENE_FIELDS = [
+  ['room_name', 'Scene name', 1],
+  ['room_details', 'Room details', 3],
+  ['furniture_types', 'Furniture types', 1],
+  ['materials', 'Materials', 2],
+  ['lighting', 'Lighting', 2],
+  ['camera', 'Camera', 1],
+  ['color_grade', 'Color grade', 1],
+  ['negative_styling_rules', 'Avoid', 2],
+  ['hero_object_placement_logic', 'Hero placement', 2],
+  ['realism_constraints', 'Realism', 2],
+];
+
+// Re-encode as a JPEG no larger than 1536px, so the request stays small and the format is
+// one Claude accepts. Resolves null when the browser can't decode the file (e.g. HEIC in Chrome).
+function resizeImageDataUrl(dataUrl, maxDim = 1536) {
+  return new Promise((resolve) => {
+    const img = new window.Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL('image/jpeg', 0.85));
+    };
+    img.onerror = () => resolve(null);
+    img.src = dataUrl;
+  });
+}
+
+function TagPicker({ label, options, value, onChange }) {
+  const selected = value.split(',').map((t) => t.trim()).filter(Boolean);
+  const has = (o) => selected.some((t) => t.toLowerCase() === o.toLowerCase());
+  const toggle = (o) => onChange((has(o) ? selected.filter((t) => t.toLowerCase() !== o.toLowerCase()) : [...selected, o]).join(', '));
+  return (
+    <div>
+      <p className="text-xs font-medium text-stone-500 mb-1.5">{label}</p>
+      <div className="flex flex-wrap gap-1.5">
+        {options.map((o) => (
+          <button
+            key={o}
+            type="button"
+            onClick={() => toggle(o)}
+            className={`text-[11px] px-2 py-0.5 rounded-full border transition-colors ${has(o) ? 'bg-stone-900 text-white border-stone-900' : 'bg-stone-50 text-stone-600 border-stone-200 hover:bg-stone-100'}`}
+          >
+            {o}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function AddSceneModal({ roomTypes, styles, onClose }) {
+  const [image, setImage] = useState(null); // { dataUrl, base64, mediaType, name }
+  const [fields, setFields] = useState(null);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+  const [added, setAdded] = useState(null); // room_name of the last row added
+
+  function pickFile(file) {
+    if (!file?.type?.startsWith('image/')) return;
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      const dataUrl = await resizeImageDataUrl(e.target.result);
+      if (!dataUrl) {
+        setError(`This browser can't read ${file.name}. Save it as a JPEG or PNG and try again.`);
+        return;
+      }
+      setImage({ dataUrl, base64: dataUrl.split(',')[1], mediaType: 'image/jpeg', name: file.name });
+      setFields(null);
+      setError(null);
+      setAdded(null);
+    };
+    reader.readAsDataURL(file);
+  }
+
+  async function analyze() {
+    setAnalyzing(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/scenes/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ imageBase64: image.base64, mediaType: image.mediaType, roomTypes, styles }),
+      });
+      const json = await res.json().catch(() => ({ error: res.status === 413 ? 'Image too large, try a smaller photo' : `Server error (${res.status})` }));
+      if (!res.ok || json.error) throw new Error(json.error || `Server error (${res.status})`);
+      setFields(json.data);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setAnalyzing(false);
+    }
+  }
+
+  async function addToSheet() {
+    setSaving(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/scenes/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scene: fields }),
+      });
+      const json = await res.json();
+      if (!res.ok || json.error) throw new Error(json.error || 'Could not add the row');
+      setAdded(fields.room_name || 'Scene');
+      setImage(null);
+      setFields(null);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const setField = (key) => (value) => setFields((f) => ({ ...f, [key]: value }));
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-stone-900/50" onClick={onClose} />
+      <div className="relative bg-white rounded-2xl shadow-xl w-full max-w-xl max-h-[90vh] flex flex-col">
+        <div className="px-5 pt-5 pb-3 border-b border-stone-100 flex items-start justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-semibold text-stone-900">Add Scene</h2>
+            <p className="text-xs text-stone-500 mt-0.5">Upload a room photo. Claude fills in the scene columns, you edit them, and the row is added to the scene sheet.</p>
+          </div>
+          <button onClick={onClose} className="text-stone-400 hover:text-stone-700" aria-label="Close">✕</button>
+        </div>
+
+        <div className="px-5 py-4 overflow-y-auto flex flex-col gap-4">
+          {added && (
+            <p className="text-sm text-emerald-800 bg-emerald-50 rounded-lg px-3 py-2">
+              Added “{added}” to the scene sheet. Generation picks it up within about 5 minutes, once Google republishes the sheet.
+            </p>
+          )}
+
+          <label
+            className={`flex flex-col items-center justify-center gap-1 rounded-xl border-2 border-dashed px-4 py-6 cursor-pointer text-center transition-colors ${image ? 'border-emerald-300 bg-emerald-50/40' : 'border-stone-200 bg-stone-50 hover:bg-stone-100'}`}
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={(e) => { e.preventDefault(); pickFile(e.dataTransfer.files?.[0]); }}
+          >
+            <span className="text-sm font-medium text-stone-700">{image ? image.name : 'Choose a room photo or drop it here'}</span>
+            <span className="text-xs text-stone-400">From your camera roll or computer</span>
+            <input type="file" accept="image/*" className="hidden" onChange={(e) => pickFile(e.target.files?.[0])} />
+          </label>
+
+          {image && (
+            /* eslint-disable-next-line @next/next/no-img-element */
+            <img src={image.dataUrl} alt="Uploaded room" className="w-full max-h-72 object-cover rounded-xl border border-stone-200" />
+          )}
+
+          {image && (
+            <button
+              onClick={analyze}
+              disabled={analyzing}
+              className="w-full text-sm font-medium px-4 py-2.5 rounded-lg bg-stone-900 text-white hover:bg-stone-700 disabled:opacity-50 transition-colors"
+            >
+              {analyzing ? 'Analyzing with Claude…' : fields ? 'Re-analyze' : 'Analyze with Claude'}
+            </button>
+          )}
+
+          {error && <p className="text-xs text-red-700 bg-red-50 rounded-lg px-3 py-2">{error}</p>}
+
+          {fields && (
+            <>
+              <TagPicker label="Room types" options={roomTypes} value={fields.room_type || ''} onChange={setField('room_type')} />
+              <TagPicker label="Styles" options={styles} value={fields.style_tags || ''} onChange={setField('style_tags')} />
+              {ADD_SCENE_FIELDS.map(([key, label, rows]) => (
+                <label key={key} className="block">
+                  <span className="text-xs font-medium text-stone-500">{label}</span>
+                  <textarea
+                    rows={rows}
+                    value={fields[key] || ''}
+                    onChange={(e) => setField(key)(e.target.value)}
+                    className="mt-1 w-full text-sm text-stone-800 rounded-lg border border-stone-200 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-stone-300 resize-y"
+                  />
+                </label>
+              ))}
+              <button
+                onClick={addToSheet}
+                disabled={saving || !fields.room_details?.trim()}
+                className="w-full text-sm font-semibold px-4 py-2.5 rounded-lg bg-emerald-700 text-white hover:bg-emerald-600 disabled:opacity-50 transition-colors"
+              >
+                {saving ? 'Adding…' : 'Add to scene sheet'}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Vendor demand dashboard (☰ → Vendor Demand) ─────────────────────────────
+
+const VENDOR_TABS = [
+  ['topCarried', 'Top sellers'],
+  ['topNotCarried', "Don't carry"],
+  ['runningLow', 'Running low'],
+  ['soldOutSelling', 'Sold out'],
+  ['byType', 'By type'],
+  ['housekeeping', 'Cleanup'],
+];
+
+function VendorStat({ label, value, tone = 'text-stone-900' }) {
+  return (
+    <div className="text-right shrink-0">
+      <p className={`text-sm font-semibold tabular-nums ${tone}`}>{value}</p>
+      <p className="text-[10px] text-stone-400">{label}</p>
+    </div>
+  );
+}
+
+function VendorProductRow({ row, onMakeRoom, extra }) {
+  const p = row.product;
+  return (
+    <div className="flex items-center gap-3 py-2.5">
+      {p.thumbnail
+        ? <img src={p.thumbnail} alt={p.title} className="w-12 h-12 object-cover rounded-md bg-stone-100 shrink-0" />
+        : <div className="w-12 h-12 rounded-md bg-stone-100 shrink-0" />}
+      <div className="flex-1 min-w-0">
+        <a href={`https://htgtfurniture.com/products/${p.handle}`} target="_blank" rel="noopener noreferrer" className="block text-sm text-stone-800 truncate hover:underline">{p.title}</a>
+        <p className="text-[11px] text-stone-500 truncate">{p.productType || 'No type'} · SKU {row.sku}{row.notes?.length ? ` · ${row.notes.join(' / ')}` : ''}</p>
+      </div>
+      {extra}
+      <VendorStat label="units" value={`${row.unitsOut}${row.capped ? '+' : ''}`} />
+      <VendorStat label="/wk" value={row.perWeek} />
+      <VendorStat label="Uttermost inv" value={row.vendorStock} tone={row.vendorStock === 0 ? 'text-red-600' : row.vendorStock <= 5 ? 'text-amber-600' : 'text-stone-900'} />
+      {p.qty !== row.vendorStock && (
+        <VendorStat label="Your inv" value={p.qty === 999 ? '999 (override)' : p.qty} tone="text-stone-500" />
+      )}
+      {onMakeRoom && (
+        <button
+          onClick={() => onMakeRoom([{ id: p.id, title: p.title, handle: p.handle, productType: p.productType, thumbnail: p.thumbnail }])}
+          disabled={!p.hasStyle || row.vendorStock === 0}
+          title={!p.hasStyle ? 'Needs a design style (custom.design_style) before it can be used in rooms' : row.vendorStock === 0 ? 'Sold out at Uttermost' : 'Generate rooms featuring this product'}
+          className="shrink-0 text-xs font-medium px-3 py-1.5 rounded-lg bg-violet-600 text-white hover:bg-violet-500 disabled:bg-stone-200 disabled:text-stone-500 transition-colors"
+        >
+          Make a room
+        </button>
+      )}
+    </div>
+  );
+}
+
+function VendorDemandModal({ state, onClose, onSync, onMakeRoom }) {
+  const [tab, setTab] = useState('topCarried');
+  const { loading, syncing, error, syncResult, data } = state;
+  const maxType = data?.byType?.[0]?.unitsOut || 1;
+
+  const counts = data?.ready ? {
+    topCarried: data.topCarried.length,
+    topNotCarried: data.topNotCarried.length,
+    runningLow: data.runningLow.length,
+    soldOutSelling: data.soldOutSelling.length,
+    byType: data.byType.length,
+    housekeeping: data.housekeeping.discontinuedActive.length + data.housekeeping.overrideHasStock.length,
+  } : {};
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-stone-900/50" onClick={onClose} />
+      <div className="relative bg-white rounded-2xl shadow-xl w-full max-w-4xl max-h-[90vh] flex flex-col">
+        <div className="px-5 pt-5 pb-3 border-b border-stone-100">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <h2 className="text-lg font-semibold text-stone-900">Vendor Demand</h2>
+              <p className="text-xs text-stone-500 mt-0.5">
+                {data?.ready
+                  ? `Uttermost sell-through from ${data.snapshots} daily inventory feeds, ${data.from} to ${data.to}. Units are day-over-day warehouse drops across all dealers; "+" means stock sat at the 50 cap, so real sales are higher.`
+                  : 'Estimated Uttermost sell-through from the daily inventory feed emails.'}
+              </p>
+            </div>
+            <button onClick={onClose} className="text-stone-400 hover:text-stone-700" aria-label="Close">✕</button>
+          </div>
+
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            {data?.ready && VENDOR_TABS.map(([key, label]) => (
+              <button
+                key={key}
+                onClick={() => setTab(key)}
+                className={`text-xs font-medium px-3 py-1.5 rounded-full transition-colors ${tab === key ? 'bg-stone-900 text-white' : 'bg-stone-100 text-stone-600 hover:bg-stone-200'}`}
+              >
+                {label}{counts[key] ? ` (${counts[key]})` : ''}
+              </button>
+            ))}
+            <div className="ml-auto flex items-center gap-3">
+              {syncResult && (
+                <span className="text-xs text-stone-500">
+                  {syncResult.added > 0 ? `Synced ${syncResult.added} new day${syncResult.added === 1 ? '' : 's'}` : 'Already up to date'}
+                </span>
+              )}
+              <button
+                onClick={onSync}
+                disabled={syncing || loading}
+                className="text-xs font-medium px-3 py-1.5 rounded-lg bg-stone-900 text-white hover:bg-stone-700 disabled:opacity-50 transition-colors"
+              >
+                {syncing ? 'Syncing…' : 'Sync feed'}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="overflow-y-auto px-5 py-4 flex-1">
+          {error && <p className="text-sm text-red-600 mb-3">{error}</p>}
+          {loading && !data && <p className="text-sm text-stone-500 py-10 text-center">Reading the feed history and your Shopify catalog…</p>}
+          {data && !data.ready && (
+            <p className="text-sm text-stone-500 py-10 text-center">
+              Not enough feed history yet ({data.snapshots} day{data.snapshots === 1 ? '' : 's'}). Click Sync feed to pull the daily files from the Apps Script archive.
+            </p>
+          )}
+
+          {data?.ready && tab === 'topCarried' && (
+            <div className="divide-y divide-stone-100">
+              {data.topCarried.map((r) => <VendorProductRow key={r.sku} row={r} onMakeRoom={onMakeRoom} />)}
+            </div>
+          )}
+
+          {data?.ready && tab === 'topNotCarried' && (
+            <div className="divide-y divide-stone-100">
+              <p className="text-xs text-stone-500 pb-2">Uttermost SKUs that sell across dealers but aren't on your store. Names and photos come from uttermost.com.</p>
+              {data.topNotCarried.map((r) => (
+                <div key={r.sku} className="flex items-center gap-3 py-2.5">
+                  {r.uttermost?.image
+                    ? <img src={r.uttermost.image} alt={r.uttermost.name} className="w-12 h-12 object-cover rounded-md bg-stone-100 shrink-0" />
+                    : <div className="w-12 h-12 rounded-md bg-stone-100 shrink-0" />}
+                  <div className="flex-1 min-w-0">
+                    {r.uttermost?.url
+                      ? <a href={r.uttermost.url} target="_blank" rel="noopener noreferrer" className="block text-sm text-stone-800 truncate hover:underline">{r.uttermost.name}</a>
+                      : <p className="text-sm text-stone-800 truncate">{r.uttermost?.name ?? 'Name not found on uttermost.com'}</p>}
+                    <p className="text-[11px] text-stone-500 truncate">
+                      {r.uttermost?.category ? `${r.uttermost.category} · ` : ''}SKU {r.sku}{r.notes?.length ? ` · ${r.notes.join(' / ')}` : ''}
+                    </p>
+                  </div>
+                  {r.uttermost?.nationalBestSeller && (
+                    <span className="shrink-0 text-[10px] font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-full px-2 py-0.5">National best seller</span>
+                  )}
+                  <VendorStat label="units" value={`${r.unitsOut}${r.capped ? '+' : ''}`} />
+                  <VendorStat label="/wk" value={r.perWeek} />
+                  <VendorStat label="Uttermost inv" value={r.vendorStock} tone={r.vendorStock === 0 ? 'text-red-600' : 'text-stone-900'} />
+                </div>
+              ))}
+            </div>
+          )}
+
+          {data?.ready && tab === 'runningLow' && (
+            <div className="divide-y divide-stone-100">
+              <p className="text-xs text-stone-500 pb-2">Your products selling fast enough to run out at Uttermost within 21 days. Hold off on pins and ads for these until restocked.</p>
+              {data.runningLow.map((r) => (
+                <VendorProductRow key={r.sku} row={r} extra={<VendorStat label="days left" value={r.daysOfCover} tone="text-amber-600" />} />
+              ))}
+            </div>
+          )}
+
+          {data?.ready && tab === 'soldOutSelling' && (
+            <div className="divide-y divide-stone-100">
+              <p className="text-xs text-stone-500 pb-2">Sold out at Uttermost now, but were selling. Good candidates to promote once they're back; restock dates are shown when Uttermost lists them.</p>
+              {data.soldOutSelling.map((r) => <VendorProductRow key={r.sku} row={r} />)}
+            </div>
+          )}
+
+          {data?.ready && tab === 'byType' && (
+            <div className="space-y-1.5">
+              <p className="text-xs text-stone-500 pb-1">
+                Estimated units sold by Uttermost to all dealers, {data.from} to {data.to}, for the products you carry, grouped by your Shopify product type. Sell-through, not inventory.
+              </p>
+              {data.byType.map((t) => (
+                <div key={t.type} className="flex items-center gap-3 text-sm">
+                  <span className="w-44 shrink-0 truncate text-stone-700">{t.type}</span>
+                  <div className="flex-1 h-4 bg-stone-100 rounded">
+                    <div className="h-4 bg-violet-500 rounded" style={{ width: `${Math.max(1, (t.unitsOut / maxType) * 100)}%` }} />
+                  </div>
+                  <span className="w-20 text-right tabular-nums text-stone-800">{t.unitsOut} sold</span>
+                  <span className="w-16 text-right text-[11px] text-stone-400">{t.skus} SKUs</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {data?.ready && tab === 'housekeeping' && (
+            <div className="space-y-5 text-sm">
+              <div>
+                <h3 className="font-medium text-stone-800">Active on your store, discontinued by Uttermost ({data.housekeeping.discontinuedActive.length})</h3>
+                {data.housekeeping.discontinuedActive.map((r) => <p key={r.sku} className="text-stone-600 mt-1">{r.product.title} <span className="text-stone-400">· SKU {r.sku}</span></p>)}
+              </div>
+              <div>
+                <h3 className="font-medium text-stone-800">999 override, but Uttermost has 10+ in stock ({data.housekeeping.overrideHasStock.length})</h3>
+                <p className="text-xs text-stone-500">The override may no longer be needed.</p>
+                {data.housekeeping.overrideHasStock.map((r) => <p key={r.sku} className="text-stone-600 mt-1">{r.product.title} <span className="text-stone-400">· SKU {r.sku} · Uttermost {r.vendorStock}</span></p>)}
+              </div>
+              <div>
+                <h3 className="font-medium text-stone-800">Active SKUs missing from the feed ({data.housekeeping.activeNotInFeed.length})</h3>
+                <p className="text-xs text-stone-500">Possibly renamed or retired at Uttermost; their stock can't be tracked.</p>
+                <p className="text-stone-600 mt-1">{data.housekeeping.activeNotInFeed.slice(0, 40).map((r) => r.sku).join(', ')}{data.housekeeping.activeNotInFeed.length > 40 ? ', …' : ''}</p>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PinField({ label, value, max, hint, children }) {
+  const len = (value || '').length;
+  return (
+    <div>
+      <div className="flex items-baseline justify-between mb-1.5">
+        <label className="text-xs font-medium text-stone-500">{label}</label>
+        <span className={`text-[10px] ${len > max ? 'text-red-600 font-medium' : 'text-stone-400'}`}>
+          {hint && <span className="mr-1">{hint} ·</span>}{len}/{max}
+        </span>
+      </div>
+      {children}
     </div>
   );
 }
@@ -1420,8 +2735,7 @@ export default function Page() {
     camera: '',
     count: '',
     productCount: 3,
-    featuredProducts: ['', '', ''],
-    pickedProduct: null,
+    featuredProducts: [null, null, null],
   });
 
   // ── Hamburger menu ──────────────────────────────────────────────────────────
@@ -1436,6 +2750,133 @@ export default function Page() {
   const [accessoriesSaving, setAccessoriesSaving] = useState(false);
   const [accessoriesSaved, setAccessoriesSaved] = useState(false);
   const [accessoriesError, setAccessoriesError] = useState(null);
+  const [hashtagsOpen, setHashtagsOpen] = useState(false);
+  const [hashtagsInput, setHashtagsInput] = useState('');
+  const [hashtagsFilter, setHashtagsFilter] = useState('');
+  const [hashtagsSaving, setHashtagsSaving] = useState(false);
+  const [hashtagsSaved, setHashtagsSaved] = useState(false);
+  const [hashtagsError, setHashtagsError] = useState(null);
+  // Pinterest state
+  const [pinterestOpen, setPinterestOpen] = useState(false);
+  const [pinterestStatus, setPinterestStatus] = useState(null); // { connected, hasCredentials, valid, username, reason }
+  const [pinterestBoards, setPinterestBoards] = useState([]);
+  const [pinterestBoard, setPinterestBoard] = useState(''); // selected board ID
+  const [pinterestLoading, setPinterestLoading] = useState(false);
+  const [pinterestTokenInput, setPinterestTokenInput] = useState('');
+  const [pinterestTokenError, setPinterestTokenError] = useState(null);
+  // Pins saved to post later
+  const [savedPinsOpen, setSavedPinsOpen] = useState(false);
+  // Pin suggestions: null = closed, otherwise { loading, error, data }
+  const [suggestions, setSuggestions] = useState(null);
+  // Vendor demand dashboard: null = closed, otherwise { open, loading, syncing, error, syncResult, data }
+  const [vendorDemand, setVendorDemand] = useState(null);
+  const [addSceneOpen, setAddSceneOpen] = useState(false);
+  const [savedPins, setSavedPins] = useState([]);
+  const [savedPinDraft, setSavedPinDraft] = useState(null); // draft open in the review modal, has .id
+  const [savedPinBusy, setSavedPinBusy] = useState(null); // 'posting' | 'saving' | null
+  const [savedPinError, setSavedPinError] = useState(null);
+  const [savedPinNotice, setSavedPinNotice] = useState(null); // { pinUrl } after a successful post
+  // Pinterest debug log
+  const [pinLogs, setPinLogs] = useState([]);
+  const [pinLogOpen, setPinLogOpen] = useState(false);
+  const pinLog = useCallback((level, msg, data) => {
+    const entry = { ts: new Date().toLocaleTimeString(), level, msg, data: data ?? null };
+    setPinLogs((prev) => [...prev.slice(-99), entry]);
+    if (level === 'error') console.error(`[pin] ${msg}`, data);
+    else console.log(`[pin] ${msg}`, data ?? '');
+  }, []);
+
+  const fetchSavedPins = useCallback(async () => {
+    try {
+      const res = await fetch('/api/pinterest/saved');
+      if (res.ok) setSavedPins(await res.json());
+    } catch { /* ignore */ }
+  }, []);
+
+  useEffect(() => { fetchSavedPins(); }, [fetchSavedPins]);
+
+  async function openSavedPin(pin) {
+    setMenuOpen(false);
+    setSavedPinError(null);
+    setSavedPinNotice(null);
+    setSavedPinDraft({
+      id: pin.id,
+      imageUrl: `/api/pinterest/saved/${pin.id}/image`,
+      title: pin.title, body: pin.body, hashtags: pin.hashtags, topics: pin.topics || '', pattern: pin.pattern || null, altText: pin.altText,
+      link: pin.link || '', boardId: pin.boardId || '',
+      library: criteria?.pinterestHashtags ?? [], loading: false, error: null,
+      products: pin.tagProducts ?? [],
+    });
+    // Board list and hashtag library may not be loaded yet if the Pinterest / hashtag panels were never opened
+    if (pinterestBoards.length === 0 && pinterestStatus?.connected) {
+      fetch('/api/pinterest/boards').then((r) => (r.ok ? r.json() : [])).then(setPinterestBoards).catch(() => {});
+    }
+    if (!criteria) {
+      fetch('/api/config').then((r) => r.json()).then((c) => {
+        setCriteria(c);
+        setSavedPinDraft((d) => d && ({ ...d, library: c.pinterestHashtags ?? [] }));
+      }).catch(() => {});
+    }
+  }
+
+  function savedPinFields(draft) {
+    const { title, body, hashtags, topics, pattern, altText, link, boardId, products } = draft;
+    return { title, body, hashtags, topics, pattern, altText, link, boardId, tagProducts: products ?? [] };
+  }
+
+  async function saveSavedPinChanges(draft) {
+    setSavedPinBusy('saving');
+    setSavedPinError(null);
+    try {
+      const res = await fetch(`/api/pinterest/saved/${draft.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(savedPinFields(draft)),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? 'Save failed');
+      setSavedPinDraft(null);
+      await fetchSavedPins();
+    } catch (err) {
+      setSavedPinError(err.message);
+    } finally {
+      setSavedPinBusy(null);
+    }
+  }
+
+  async function postSavedPin(draft) {
+    setSavedPinBusy('posting');
+    setSavedPinError(null);
+    try {
+      const res = await fetch(`/api/pinterest/saved/${draft.id}/post`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(savedPinFields(draft)),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        pinLog('error', `Saved pin post failed: ${data.error}`, data);
+        setSavedPinError(pinErrorText(pinErrorCode(data)));
+        if (data.authError) fetchPinterestStatus();
+        await fetchSavedPins(); // edits were stored before posting
+        return;
+      }
+      pinLog('info', `Saved pin posted: ${data.pinUrl}`, data);
+      setSavedPinDraft(null);
+      setSavedPinNotice({ pinUrl: data.pinUrl, tagSummary: pinTagSummary(data.tagging) });
+      await fetchSavedPins();
+    } catch (err) {
+      setSavedPinError(err.message);
+    } finally {
+      setSavedPinBusy(null);
+    }
+  }
+
+  async function deleteSavedPin(pin) {
+    if (!confirm(`Delete saved pin "${pin.title || 'Untitled'}"?`)) return;
+    await fetch(`/api/pinterest/saved/${pin.id}`, { method: 'DELETE' }).catch(() => {});
+    await fetchSavedPins();
+  }
 
   async function openMenu() {
     setMenuOpen(true);
@@ -1494,6 +2935,77 @@ export default function Page() {
     }
   }
 
+  function addHashtags(text) {
+    const parsed = parseHashtags(text);
+    if (!parsed.length) return;
+    setCriteria((c) => ({ ...c, pinterestHashtags: dedupeHashtags([...(c.pinterestHashtags ?? []), ...parsed]) }));
+  }
+
+  async function uploadHashtagFile(e) {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    addHashtags(await file.text());
+  }
+
+  async function saveHashtags() {
+    setHashtagsSaving(true);
+    setHashtagsSaved(false);
+    setHashtagsError(null);
+    try {
+      const res = await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pinterestHashtags: criteria.pinterestHashtags ?? [] }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? 'Save failed');
+      setCriteria((c) => ({ ...c, pinterestHashtags: data.pinterestHashtags }));
+      setHashtagsSaved(true);
+      setTimeout(() => setHashtagsSaved(false), 2500);
+    } catch (err) {
+      setHashtagsError(err.message);
+    } finally {
+      setHashtagsSaving(false);
+    }
+  }
+
+  // Fetch Pinterest status on mount and when window regains focus (after OAuth redirect)
+  const fetchPinterestStatus = useCallback(async () => {
+    pinLog('info', 'Checking Pinterest status…');
+    try {
+      const res = await fetch('/api/pinterest/status?validate=1');
+      const data = await res.json();
+      setPinterestStatus(data);
+      pinLog(data.valid === false ? 'warn' : 'info', `Status: connected=${data.connected} valid=${data.valid} user=${data.username ?? '—'} host=${data.apiHost ?? '—'}`, data);
+      if (data.valid && data.canWrite === false) {
+        pinLog('warn', 'Token is READ-ONLY — missing write scopes. Use OAuth "Connect to Pinterest" to get write access.');
+      } else if (data.valid && data.canWrite) {
+        pinLog('info', `Scopes: ${(data.scopes || []).join(', ')}`);
+      }
+      if (data.connected && data.valid !== false && pinterestBoards.length === 0) {
+        pinLog('info', 'Fetching boards…');
+        const bRes = await fetch('/api/pinterest/boards');
+        if (bRes.ok) {
+          const boards = await bRes.json();
+          setPinterestBoards(boards);
+          pinLog('info', `Loaded ${boards.length} board(s)`);
+        } else {
+          pinLog('error', `Boards fetch failed: ${bRes.status}`);
+        }
+      }
+    } catch (err) {
+      pinLog('error', 'Status check failed', err.message);
+    }
+  }, [pinterestBoards.length, pinLog]);
+
+  useEffect(() => {
+    fetchPinterestStatus();
+    const onFocus = () => fetchPinterestStatus();
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, [fetchPinterestStatus]);
+
   useEffect(() => {
     fetch('/api/options')
       .then((r) => r.json())
@@ -1512,26 +3024,86 @@ export default function Page() {
   }
 
   function clearFilters() {
-    setFilters({ designStyle: '', roomType: '', roomName: '', lighting: '', camera: '', count: '', productCount: 3, featuredProducts: ['', '', ''], pickedProduct: null });
+    setFilters({ designStyle: '', roomType: '', roomName: '', lighting: '', camera: '', count: '', productCount: 3, featuredProducts: [null, null, null] });
   }
 
   const hasActiveFilters =
-    !!(filters.designStyle || filters.roomType || filters.roomName || filters.lighting || filters.camera || filters.count || filters.pickedProduct || filters.featuredProducts.some(h => h)) ||
+    !!(filters.designStyle || filters.roomType || filters.roomName || filters.lighting || filters.camera || filters.count || filters.featuredProducts.some(p => p)) ||
     filters.productCount !== 3;
 
-  async function generate() {
+  async function loadSuggestions(refresh = false) {
+    setSuggestions((s) => ({ ...s, loading: true, error: null }));
+    try {
+      const res = await fetch(`/api/pinterest/suggestions${refresh ? '?refresh=1' : ''}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? 'Could not load suggestions');
+      setSuggestions({ loading: false, error: null, data });
+    } catch (err) {
+      setSuggestions((s) => ({ ...s, loading: false, error: err.message }));
+    }
+  }
+
+  async function loadVendorDemand(refresh = false) {
+    setVendorDemand((v) => ({ ...v, open: true, loading: true, error: null }));
+    try {
+      const res = await fetch(`/api/vendor/demand${refresh ? '?refresh=1' : ''}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? 'Could not load vendor demand');
+      setVendorDemand((v) => ({ ...v, loading: false, data }));
+    } catch (err) {
+      setVendorDemand((v) => ({ ...v, loading: false, error: err.message }));
+    }
+  }
+
+  async function syncVendorFeed() {
+    setVendorDemand((v) => ({ ...v, syncing: true, error: null, syncResult: null }));
+    try {
+      const res = await fetch('/api/vendor/sync', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? 'Sync failed');
+      setVendorDemand((v) => ({ ...v, syncing: false, syncResult: data }));
+      if (data.added > 0) await loadVendorDemand(true);
+    } catch (err) {
+      setVendorDemand((v) => ({ ...v, syncing: false, error: err.message }));
+    }
+  }
+
+  function openVendorDemand() {
+    setMenuOpen(false);
+    if (vendorDemand?.data) setVendorDemand((v) => ({ ...v, open: true }));
+    else loadVendorDemand();
+  }
+
+  function openSuggestions() {
+    setMenuOpen(false);
+    setSuggestions((s) => ({ ...(s ?? { loading: true }), open: true }));
+    if (!suggestions?.data) loadSuggestions();
+  }
+
+  // Feature the suggested products (up to the 3 featured slots) and generate rooms around them
+  function makeRoomFrom(products) {
+    const slots = [...products.slice(0, 3).map(({ id, title, handle, productType, thumbnail }) => ({ id, title, handle, productType, thumbnail }))];
+    while (slots.length < 3) slots.push(null);
+    const next = { ...filters, featuredProducts: slots };
+    setFilters(next);
+    setSuggestions((s) => (s ? { ...s, open: false } : s));
+    setVendorDemand((v) => (v ? { ...v, open: false } : v));
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    generate(next);
+  }
+
+  async function generate(source = filters) {
     setLoading(true);
     setError(null);
     setRooms([]);
 
     const activeFilters = Object.fromEntries(
-      Object.entries(filters).filter(([k, v]) => {
+      Object.entries(source).filter(([k, v]) => {
         if (k === 'featuredProducts') return false; // handled below
         return String(v).trim();
       })
     );
-    const nonEmptyHandles = filters.featuredProducts.filter(h => h.trim());
-    if (filters.pickedProduct) nonEmptyHandles.push(filters.pickedProduct.handle);
+    const nonEmptyHandles = source.featuredProducts.filter(p => p).map(p => p.handle);
     if (nonEmptyHandles.length > 0) activeFilters.featuredProducts = nonEmptyHandles;
     if (mode !== 'standard') activeFilters.mode = mode;
 
@@ -1552,6 +3124,7 @@ export default function Page() {
   }
 
   return (
+    <>
     <main className="max-w-7xl mx-auto px-6 py-12">
       {/* Header */}
       <div className="mb-8 flex items-start justify-between gap-4">
@@ -1820,6 +3393,385 @@ export default function Page() {
                       </button>
                     </div>
                   )}
+
+                  {/* Pin suggestions row */}
+                  <button
+                    onClick={openSuggestions}
+                    className="flex items-center justify-between w-full px-4 py-3 hover:bg-stone-50 transition-colors text-left border-t border-stone-100"
+                  >
+                    <span className="text-sm font-medium text-stone-700">Pin Suggestions</span>
+                    <span className="text-[10px] text-stone-400">What to pin next</span>
+                  </button>
+
+                  {/* Add scene row */}
+                  <button
+                    onClick={() => { setAddSceneOpen(true); setMenuOpen(false); }}
+                    className="flex items-center justify-between w-full px-4 py-3 hover:bg-stone-50 transition-colors text-left border-t border-stone-100"
+                  >
+                    <span className="text-sm font-medium text-stone-700">Add Scene</span>
+                    <span className="text-[10px] text-stone-400">From a room photo</span>
+                  </button>
+
+                  {/* Vendor demand row */}
+                  <button
+                    onClick={openVendorDemand}
+                    className="flex items-center justify-between w-full px-4 py-3 hover:bg-stone-50 transition-colors text-left border-t border-stone-100"
+                  >
+                    <span className="text-sm font-medium text-stone-700">Vendor Demand</span>
+                    <span className="text-[10px] text-stone-400">Uttermost sell-through</span>
+                  </button>
+
+                  {/* Saved pins row */}
+                  <button
+                    onClick={() => setSavedPinsOpen((o) => !o)}
+                    className="flex items-center justify-between w-full px-4 py-3 hover:bg-stone-50 transition-colors text-left border-t border-stone-100"
+                  >
+                    <span className="text-sm font-medium text-stone-700 flex items-center gap-2">
+                      Saved Pins
+                      {savedPins.length > 0 && (
+                        <span className="text-[10px] font-medium text-white bg-rose-600 rounded-full px-1.5 py-0.5 leading-none">{savedPins.length}</span>
+                      )}
+                    </span>
+                    <svg
+                      className={`w-4 h-4 text-stone-400 transition-transform ${savedPinsOpen ? 'rotate-180' : ''}`}
+                      fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
+                    >
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                    </svg>
+                  </button>
+
+                  {/* Saved pins panel */}
+                  {savedPinsOpen && (
+                    <div className="border-t border-stone-100 px-4 py-3 space-y-2 max-h-96 overflow-y-auto">
+                      {savedPins.length === 0 && (
+                        <p className="text-xs text-stone-300 italic">No saved pins. Use “Save for later” in the pin review.</p>
+                      )}
+                      {savedPins.map((pin) => (
+                        <div key={pin.id} className="flex gap-3 items-start group">
+                          <button onClick={() => openSavedPin(pin)} className="shrink-0" title="Review & post">
+                            <img
+                              src={`/api/pinterest/saved/${pin.id}/image`}
+                              alt={pin.altText || pin.title}
+                              className="w-12 h-[72px] object-cover rounded-md bg-stone-100"
+                            />
+                          </button>
+                          <div className="flex-1 min-w-0">
+                            <button onClick={() => openSavedPin(pin)} className="block text-left w-full">
+                              <p className="text-xs font-medium text-stone-700 line-clamp-2">{pin.title || 'Untitled pin'}</p>
+                              <p className="text-[10px] text-stone-400 mt-0.5">
+                                {pin.roomName ? `${pin.roomName} · ` : ''}{new Date(pin.savedAt).toLocaleDateString()}
+                              </p>
+                            </button>
+                            <div className="flex gap-3 mt-1">
+                              <button onClick={() => openSavedPin(pin)} className="text-[11px] font-medium text-rose-600 hover:underline">
+                                Review & post
+                              </button>
+                              <button onClick={() => deleteSavedPin(pin)} className="text-[11px] text-stone-400 hover:text-red-500">
+                                Delete
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Pinterest hashtags row */}
+                  <button
+                    onClick={() => setHashtagsOpen((o) => !o)}
+                    className="flex items-center justify-between w-full px-4 py-3 hover:bg-stone-50 transition-colors text-left border-t border-stone-100"
+                  >
+                    <span className="text-sm font-medium text-stone-700 flex items-center gap-2">
+                      Pinterest Hashtags
+                      {(criteria?.pinterestHashtags ?? []).length > 0 && (
+                        <span className="text-[10px] font-normal text-stone-400">{criteria.pinterestHashtags.length}</span>
+                      )}
+                    </span>
+                    <svg
+                      className={`w-4 h-4 text-stone-400 transition-transform ${hashtagsOpen ? 'rotate-180' : ''}`}
+                      fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
+                    >
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                    </svg>
+                  </button>
+
+                  {/* Pinterest hashtags panel */}
+                  {hashtagsOpen && criteria && (
+                    <div className="border-t border-stone-100 px-4 py-4 space-y-3">
+                      <p className="text-xs text-stone-400">
+                        Each pin gets up to 3 specific hashtags picked from this library to match the room. Leave it empty to let Claude write its own.
+                      </p>
+
+                      {/* Add / paste */}
+                      <textarea
+                        value={hashtagsInput}
+                        onChange={(e) => setHashtagsInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && !e.shiftKey) {
+                            e.preventDefault();
+                            addHashtags(hashtagsInput);
+                            setHashtagsInput('');
+                          }
+                        }}
+                        rows={2}
+                        placeholder="#IndustrialDecor #LoftLiving, mid century modern…"
+                        className="w-full text-xs text-stone-700 bg-stone-50 border border-stone-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-stone-400 font-mono placeholder:text-stone-400 resize-none"
+                      />
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => { addHashtags(hashtagsInput); setHashtagsInput(''); }}
+                          disabled={!hashtagsInput.trim()}
+                          className="flex-1 text-xs font-medium px-3 py-2 rounded-lg bg-stone-200 text-stone-600 hover:bg-stone-300 disabled:opacity-50 transition-colors"
+                        >
+                          Add
+                        </button>
+                        <label className="flex-1 text-center cursor-pointer text-xs font-medium px-3 py-2 rounded-lg bg-stone-200 text-stone-600 hover:bg-stone-300 transition-colors">
+                          Upload .txt / .csv
+                          <input type="file" accept=".txt,.csv,text/plain,text/csv" onChange={uploadHashtagFile} className="hidden" />
+                        </label>
+                      </div>
+
+                      {/* Library */}
+                      {(criteria.pinterestHashtags ?? []).length > 8 && (
+                        <input
+                          type="text"
+                          value={hashtagsFilter}
+                          onChange={(e) => setHashtagsFilter(e.target.value)}
+                          placeholder="Filter…"
+                          className="w-full text-xs text-stone-700 bg-white border border-stone-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-stone-400 placeholder:text-stone-400"
+                        />
+                      )}
+                      <div className="flex flex-wrap gap-1.5 max-h-52 overflow-y-auto">
+                        {(criteria.pinterestHashtags ?? [])
+                          .filter((t) => t.toLowerCase().includes(hashtagsFilter.trim().toLowerCase().replace(/^#/, '')))
+                          .map((tag) => (
+                            <span key={tag} className="inline-flex items-center gap-1 text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-full pl-2.5 pr-1 py-0.5">
+                              {tag}
+                              <button
+                                onClick={() => setCriteria((c) => ({
+                                  ...c,
+                                  pinterestHashtags: c.pinterestHashtags.filter((t) => t !== tag),
+                                }))}
+                                className="text-rose-300 hover:text-red-600 transition-colors"
+                                title="Remove"
+                              >
+                                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                                </svg>
+                              </button>
+                            </span>
+                          ))}
+                        {(criteria.pinterestHashtags ?? []).length === 0 && (
+                          <p className="text-xs text-stone-300 italic">No hashtags yet.</p>
+                        )}
+                      </div>
+                      {(criteria.pinterestHashtags ?? []).length > 0 && (
+                        <button
+                          onClick={() => { if (confirm('Remove all hashtags from the library?')) setCriteria((c) => ({ ...c, pinterestHashtags: [] })); }}
+                          className="text-xs text-stone-400 hover:text-red-500 transition-colors"
+                        >
+                          Clear all
+                        </button>
+                      )}
+
+                      {/* Save */}
+                      {hashtagsError && (
+                        <p className="text-xs text-red-600">{hashtagsError}</p>
+                      )}
+                      <button
+                        onClick={saveHashtags}
+                        disabled={hashtagsSaving}
+                        className={`w-full text-sm font-medium py-2 rounded-lg transition-colors ${
+                          hashtagsSaved
+                            ? 'bg-green-100 text-green-800'
+                            : 'bg-stone-900 text-white hover:bg-stone-700 disabled:opacity-50 disabled:cursor-wait'
+                        }`}
+                      >
+                        {hashtagsSaved ? 'Saved' : hashtagsSaving ? 'Saving…' : 'Save Hashtags'}
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Pinterest row */}
+                  <button
+                    onClick={() => setPinterestOpen((o) => !o)}
+                    className="flex items-center justify-between w-full px-4 py-3 hover:bg-stone-50 transition-colors text-left border-t border-stone-100"
+                  >
+                    <span className="text-sm font-medium text-stone-700 flex items-center gap-2">
+                      <PinterestIcon className="w-4 h-4 text-rose-500" />
+                      Pinterest
+                      {pinterestStatus?.connected && pinterestStatus?.valid !== false && (
+                        <span className={`w-2 h-2 rounded-full inline-block ${pinterestStatus.canWrite === false ? 'bg-amber-500' : 'bg-green-500'}`} title={pinterestStatus.canWrite === false ? 'Read-only' : 'Connected'} />
+                      )}
+                      {pinterestStatus?.connected && pinterestStatus?.valid === false && (
+                        <span className="w-2 h-2 rounded-full bg-amber-500 inline-block" title="Session expired" />
+                      )}
+                    </span>
+                    <svg
+                      className={`w-4 h-4 text-stone-400 transition-transform ${pinterestOpen ? 'rotate-180' : ''}`}
+                      fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
+                    >
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                    </svg>
+                  </button>
+
+                  {/* Pinterest panel */}
+                  {pinterestOpen && (
+                    <div className="border-t border-stone-100 px-4 py-4 space-y-3">
+                      {/* Expired session warning */}
+                      {pinterestStatus?.connected && pinterestStatus?.valid === false && (
+                        <div className="flex items-center gap-2 text-xs text-amber-700 bg-amber-50 px-3 py-2 rounded-lg">
+                          <span className="w-2 h-2 rounded-full bg-amber-500 shrink-0" />
+                          <span>Session expired{pinterestStatus.reason ? ` (${pinterestStatus.reason})` : ''} — reconnect or paste a new token below.</span>
+                        </div>
+                      )}
+
+                      {/* Connected + valid */}
+                      {pinterestStatus?.connected && pinterestStatus?.valid !== false && (
+                        <>
+                          <div className={`flex items-center gap-2 text-xs px-3 py-2 rounded-lg ${pinterestStatus.canWrite === false ? 'text-amber-700 bg-amber-50' : 'text-green-700 bg-green-50'}`}>
+                            <span className={`w-2 h-2 rounded-full ${pinterestStatus.canWrite === false ? 'bg-amber-500' : 'bg-green-500'}`} />
+                            <span>
+                              Connected to Pinterest{pinterestStatus.username ? ` as ${pinterestStatus.username}` : ''}
+                              {pinterestStatus.canWrite === false && <><br /><strong>Read-only token</strong> — use OAuth below to get write access</>}
+                            </span>
+                          </div>
+
+                          {/* Board picker */}
+                          <div>
+                            <label className="block text-xs font-medium text-stone-500 mb-1.5">Board</label>
+                            <select
+                              value={pinterestBoard}
+                              onChange={(e) => setPinterestBoard(e.target.value)}
+                              className="w-full text-sm text-stone-700 bg-white border border-stone-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-stone-400"
+                            >
+                              <option value="">Select a board…</option>
+                              {pinterestBoards.map((b) => (
+                                <option key={b.id} value={b.id}>{b.name}</option>
+                              ))}
+                            </select>
+                            {pinterestBoards.length === 0 && (
+                              <button
+                                onClick={async () => {
+                                  setPinterestLoading(true);
+                                  try {
+                                    const res = await fetch('/api/pinterest/boards');
+                                    if (res.ok) setPinterestBoards(await res.json());
+                                  } catch { /* ignore */ }
+                                  finally { setPinterestLoading(false); }
+                                }}
+                                disabled={pinterestLoading}
+                                className="text-xs text-rose-600 hover:underline mt-1"
+                              >
+                                {pinterestLoading ? 'Loading boards…' : 'Refresh boards'}
+                              </button>
+                            )}
+                          </div>
+                        </>
+                      )}
+
+                      {/* OAuth connect button — shown when disconnected or expired */}
+                      {(!pinterestStatus?.connected || pinterestStatus?.valid === false) && pinterestStatus?.hasCredentials && (
+                        <button
+                          onClick={async () => {
+                            setPinterestLoading(true);
+                            try {
+                              const res = await fetch('/api/pinterest/auth');
+                              const data = await res.json();
+                              if (data.authUrl) window.open(data.authUrl, '_blank');
+                            } catch { /* ignore */ }
+                            finally { setPinterestLoading(false); }
+                          }}
+                          disabled={pinterestLoading}
+                          className="w-full text-sm font-medium py-2 rounded-lg bg-rose-600 text-white hover:bg-rose-500 disabled:opacity-50 transition-colors flex items-center justify-center gap-2"
+                        >
+                          <PinterestIcon className="w-4 h-4" />
+                          {pinterestLoading ? 'Loading…' : pinterestStatus?.connected ? 'Reconnect to Pinterest' : 'Connect to Pinterest'}
+                        </button>
+                      )}
+
+                      {/* No credentials hint */}
+                      {!pinterestStatus?.hasCredentials && !pinterestStatus?.connected && (
+                        <p className="text-xs text-stone-400">
+                          Add <code className="bg-stone-100 px-1 rounded text-[10px]">PINTEREST_APP_ID</code> and <code className="bg-stone-100 px-1 rounded text-[10px]">PINTEREST_APP_SECRET</code> to <code className="bg-stone-100 px-1 rounded text-[10px]">.env.local</code> to enable OAuth, or paste a token below.
+                        </p>
+                      )}
+
+                      {/* Manual token input — always available */}
+                      <div className="border-t border-stone-100 pt-3">
+                        <label className="block text-xs font-medium text-stone-500 mb-1.5">
+                          Paste access token
+                        </label>
+                        <p className="text-[10px] text-stone-400 mb-1.5">
+                          From the Pinterest developer dashboard. Works without OAuth app credentials.
+                        </p>
+                        <div className="flex gap-2">
+                          <input
+                            type="text"
+                            value={pinterestTokenInput}
+                            onChange={(e) => { setPinterestTokenInput(e.target.value); setPinterestTokenError(null); }}
+                            placeholder="pina_…"
+                            className="flex-1 text-xs text-stone-700 bg-stone-50 border border-stone-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-stone-400 font-mono placeholder:text-stone-400"
+                          />
+                          <button
+                            onClick={async () => {
+                              if (!pinterestTokenInput.trim()) return;
+                              setPinterestLoading(true);
+                              setPinterestTokenError(null);
+                              pinLog('info', 'Saving token from menu…');
+                              try {
+                                const res = await fetch('/api/pinterest/token', {
+                                  method: 'POST',
+                                  headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify({ accessToken: pinterestTokenInput.trim() }),
+                                });
+                                const data = await res.json();
+                                if (!res.ok) throw new Error(data.error ?? 'Save failed');
+                                if (!data.valid) {
+                                  pinLog('warn', `Token invalid: ${data.reason}`, data);
+                                  setPinterestTokenError(`Token saved but invalid: ${data.reason || 'unknown error'}`);
+                                } else {
+                                  pinLog('info', `Token valid: user=${data.username ?? '—'}`, data);
+                                  setPinterestTokenInput('');
+                                }
+                                // Refresh status either way
+                                await fetchPinterestStatus();
+                              } catch (err) {
+                                pinLog('error', `Token save error: ${err.message}`);
+                                setPinterestTokenError(err.message);
+                              } finally {
+                                setPinterestLoading(false);
+                              }
+                            }}
+                            disabled={pinterestLoading || !pinterestTokenInput.trim()}
+                            className="shrink-0 text-xs font-medium px-3 py-2 rounded-lg bg-stone-800 text-white hover:bg-stone-700 disabled:opacity-50 transition-colors"
+                          >
+                            {pinterestLoading ? 'Saving…' : 'Save'}
+                          </button>
+                        </div>
+                        {pinterestTokenError && (
+                          <p className="text-xs text-red-600 mt-1.5">{pinterestTokenError}</p>
+                        )}
+                      </div>
+
+                      {/* Disconnect — shown when connected */}
+                      {pinterestStatus?.connected && (
+                        <button
+                          onClick={async () => {
+                            try {
+                              await fetch('/api/pinterest/disconnect', { method: 'POST' });
+                              setPinterestStatus({ ...pinterestStatus, connected: false, valid: undefined, username: undefined });
+                              setPinterestBoards([]);
+                              setPinterestBoard('');
+                            } catch { /* ignore */ }
+                          }}
+                          className="text-xs text-stone-400 hover:text-red-500 transition-colors"
+                        >
+                          Disconnect Pinterest
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
               </>
             )}
@@ -1841,22 +3793,19 @@ export default function Page() {
       {mode === 'pinterest' && (
         <div className="mb-6 px-4 py-3 bg-rose-50 border border-rose-200 rounded-xl flex items-center gap-3 text-sm text-rose-700">
           <PinterestIcon className="w-4 h-4 shrink-0" />
-          <span>Pinterest mode — images generate at 2:3 (portrait). Generated pins are saved to <code className="font-mono text-xs bg-rose-100 px-1 py-0.5 rounded">~/Downloads/new_pins_generated</code>. Shopify publishing is disabled.</span>
+          <span>Pinterest mode — Shopify publishing is disabled. Create Image lets you pick Pinterest (2:3), Portrait (4:5), or Reel (9:16); pins can be saved locally, saved for later, or posted directly.</span>
         </div>
       )}
 
       {/* Featured product banner */}
-      {(filters.featuredProducts.some(h => h) || filters.pickedProduct) && (
+      {filters.featuredProducts.some(p => p) && (
         <div className="mb-6 px-4 py-3 bg-amber-50 border border-amber-200 rounded-xl flex items-center gap-3 text-sm text-amber-700">
           <svg className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.784-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z" />
           </svg>
           <span>Featured product mode —{' '}
-            {filters.pickedProduct && (
-              <code className="font-mono text-xs bg-amber-100 px-1 py-0.5 rounded">{filters.pickedProduct.title}</code>
-            )}
-            {filters.featuredProducts.filter(h => h).map((h, i) => (
-              <span key={i}>{(i > 0 || filters.pickedProduct) && ', '}<code className="font-mono text-xs bg-amber-100 px-1 py-0.5 rounded">{h}</code></span>
+            {filters.featuredProducts.filter(p => p).map((p, i) => (
+              <span key={i}>{i > 0 && ', '}<code className="font-mono text-xs bg-amber-100 px-1 py-0.5 rounded">{p.title}</code></span>
             ))} will appear in every generated room.</span>
         </div>
       )}
@@ -1885,8 +3834,8 @@ export default function Page() {
             className={selectClass}
           >
             <option value="">Any room type</option>
-            {roomTypeOptions.map((t) => (
-              <option key={t} value={t}>{t}</option>
+            {roomTypeOptions.map((t, i) => (
+              <option key={`${t}-${i}`} value={t}>{t}</option>
             ))}
           </select>
 
@@ -1896,8 +3845,8 @@ export default function Page() {
             className={selectClass}
           >
             <option value="">Any scene</option>
-            {roomNameOptions.map((n) => (
-              <option key={n} value={n}>{n}</option>
+            {roomNameOptions.map((n, i) => (
+              <option key={`${n}-${i}`} value={n}>{n}</option>
             ))}
           </select>
 
@@ -1921,22 +3870,15 @@ export default function Page() {
             <span className="text-xs font-medium text-stone-500 uppercase tracking-wide whitespace-nowrap">
               Featured
             </span>
-            <ProductSearchPicker
-              value={filters.pickedProduct}
-              onChange={(p) => setFilter('pickedProduct', p)}
-            />
-            {filters.featuredProducts.map((handle, idx) => (
-              <input
+            {filters.featuredProducts.map((picked, idx) => (
+              <ProductSearchPicker
                 key={`fp-${idx}`}
-                type="text"
-                value={handle}
-                onChange={(e) => {
+                value={picked}
+                onChange={(p) => {
                   const next = [...filters.featuredProducts];
-                  next[idx] = e.target.value;
+                  next[idx] = p;
                   setFilter('featuredProducts', next);
                 }}
-                placeholder={`Handle ${idx + 1}…`}
-                className={inputClass + ' w-36'}
               />
             ))}
           </div>
@@ -1991,7 +3933,7 @@ export default function Page() {
       {/* Generate button */}
       <div className="flex items-center gap-4 mb-10">
         <button
-          onClick={generate}
+          onClick={() => generate()}
           disabled={loading}
           className="px-6 py-3 bg-stone-900 text-white text-sm font-medium rounded-xl hover:bg-stone-700 disabled:opacity-50 disabled:cursor-wait transition-colors"
         >
@@ -2025,8 +3967,60 @@ export default function Page() {
       {!loading && rooms.length > 0 && (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
           {rooms.map((room, i) => (
-            <RoomCard key={`${room.style}-${i}`} room={room} mode={mode} combinationNames={combinationNames} accessoriesList={accessoriesList} featuredProductHandles={[...filters.featuredProducts.filter(h => h.trim()), ...(filters.pickedProduct ? [filters.pickedProduct.handle] : [])]} />
+            <RoomCard key={`${room.style}-${i}`} room={room} mode={mode} combinationNames={combinationNames} accessoriesList={accessoriesList} featuredProductHandles={filters.featuredProducts.filter(p => p).map(p => p.handle)} pinterestConnected={!!(pinterestStatus?.connected && pinterestStatus?.valid !== false)} pinterestBoard={pinterestBoard || null} pinterestBoards={pinterestBoards} onPinSavedForLater={fetchSavedPins} onPinterestAuthError={fetchPinterestStatus} pinLog={pinLog} />
           ))}
+        </div>
+      )}
+
+      {/* Pin suggestions */}
+      {suggestions && suggestions.open !== false && (
+        <PinSuggestionsModal
+          state={suggestions}
+          onClose={() => setSuggestions((s) => ({ ...s, open: false }))}
+          onRefresh={() => loadSuggestions(true)}
+          onMakeRoom={makeRoomFrom}
+        />
+      )}
+
+      {/* Add scene from a photo */}
+      {addSceneOpen && (
+        <AddSceneModal
+          roomTypes={roomTypeOptions}
+          styles={[...new Map([...styleOptions, ...STYLE_NAMES].map((s) => [s.toLowerCase(), s])).values()].sort()}
+          onClose={() => setAddSceneOpen(false)}
+        />
+      )}
+
+      {/* Vendor demand dashboard */}
+      {vendorDemand?.open && (
+        <VendorDemandModal
+          state={vendorDemand}
+          onClose={() => setVendorDemand((v) => ({ ...v, open: false }))}
+          onSync={syncVendorFeed}
+          onMakeRoom={makeRoomFrom}
+        />
+      )}
+
+      {/* Saved pin review modal */}
+      {savedPinDraft && (
+        <PinReviewModal
+          draft={savedPinDraft}
+          onChange={setSavedPinDraft}
+          boards={pinterestBoards}
+          busy={savedPinBusy}
+          error={savedPinError}
+          onClose={() => { setSavedPinDraft(null); setSavedPinError(null); }}
+          onPost={() => postSavedPin(savedPinDraft)}
+          onSave={() => saveSavedPinChanges(savedPinDraft)}
+          saveLabel="Save changes"
+        />
+      )}
+      {savedPinNotice && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-40 bg-stone-900 text-white text-sm rounded-xl shadow-lg px-4 py-3 flex items-center gap-3">
+          <PinterestIcon className="w-4 h-4 text-rose-400" />
+          <span>Pin posted.{savedPinNotice.tagSummary ? ` ${savedPinNotice.tagSummary}` : ''}</span>
+          <a href={savedPinNotice.pinUrl} target="_blank" rel="noopener noreferrer" className="text-rose-300 hover:underline">View</a>
+          <button onClick={() => setSavedPinNotice(null)} className="text-stone-400 hover:text-white" aria-label="Dismiss">✕</button>
         </div>
       )}
 
@@ -2037,5 +4031,41 @@ export default function Page() {
         </div>
       )}
     </main>
+
+      {/* Pinterest debug log panel — fixed bottom-right */}
+      {pinLogs.length > 0 && (
+        <div className="fixed bottom-4 right-4 z-50 w-96 max-w-[calc(100vw-2rem)]">
+          <button
+            onClick={() => setPinLogOpen((o) => !o)}
+            className="ml-auto flex items-center gap-1.5 text-[10px] font-mono bg-stone-800 text-stone-300 px-3 py-1.5 rounded-t-lg hover:bg-stone-700 transition-colors"
+          >
+            <span className={`inline-block w-1.5 h-1.5 rounded-full ${pinLogs[pinLogs.length - 1]?.level === 'error' ? 'bg-red-400' : pinLogs[pinLogs.length - 1]?.level === 'warn' ? 'bg-amber-400' : 'bg-green-400'}`} />
+            Pinterest Log ({pinLogs.length})
+            <span className="ml-1">{pinLogOpen ? '▼' : '▲'}</span>
+          </button>
+          {pinLogOpen && (
+            <div className="bg-stone-900 border border-stone-700 rounded-b-lg rounded-tl-lg max-h-64 overflow-y-auto p-2 space-y-0.5">
+              {pinLogs.map((entry, i) => (
+                <div key={i} className={`text-[10px] font-mono leading-relaxed ${
+                  entry.level === 'error' ? 'text-red-400' : entry.level === 'warn' ? 'text-amber-400' : 'text-stone-400'
+                }`}>
+                  <span className="text-stone-600">{entry.ts}</span>{' '}
+                  <span>{entry.msg}</span>
+                  {entry.data && typeof entry.data === 'object' && (
+                    <details className="inline ml-1">
+                      <summary className="inline cursor-pointer text-stone-600 hover:text-stone-400">data</summary>
+                      <pre className="mt-0.5 text-[9px] text-stone-500 whitespace-pre-wrap break-all">{JSON.stringify(entry.data, null, 2)}</pre>
+                    </details>
+                  )}
+                  {entry.data && typeof entry.data === 'string' && (
+                    <span className="text-stone-600 ml-1">({entry.data})</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </>
   );
 }

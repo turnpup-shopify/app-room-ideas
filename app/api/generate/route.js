@@ -11,25 +11,38 @@ const CLI_TIMEOUT = 3 * 60 * 1000; // 3 minutes
 const MAX_CONCURRENT = 2;
 
 let activeGenerations = 0;
+const waiting = []; // resolvers for requests queued behind the concurrency limit
+
+/** Wait for a free Higgsfield slot instead of rejecting. */
+function acquireSlot() {
+  if (activeGenerations < MAX_CONCURRENT) {
+    activeGenerations++;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => waiting.push(resolve));
+}
+
+function releaseSlot() {
+  const next = waiting.shift();
+  if (next) next(); // hand the slot straight to the next request
+  else activeGenerations--;
+}
 
 /**
  * POST /api/generate
  * Body: { prompt, products: [{ title, images: [url, ...] }] }
  * Runs the Higgsfield CLI to generate a room scene image.
+ * At most MAX_CONCURRENT CLI calls run at once; extra requests wait their turn.
  */
 export async function POST(request) {
-  if (activeGenerations >= MAX_CONCURRENT) {
-    return NextResponse.json(
-      { error: 'Too many generations in progress. Please wait and try again.' },
-      { status: 429 }
-    );
-  }
-
   const config = getConfig();
   const model = config.higgsfield?.model ?? 'nano_banana_2';
 
   let tempDir = null;
-  activeGenerations++;
+  if (activeGenerations >= MAX_CONCURRENT) {
+    console.log(`[generate] ${MAX_CONCURRENT} generations running, queued (${waiting.length + 1} waiting)`);
+  }
+  await acquireSlot();
 
   try {
     const { prompt, products, aspectRatio: requestedAspectRatio } = await request.json();
@@ -71,6 +84,8 @@ export async function POST(request) {
         }
       }
     }
+
+    console.log(`[generate] ${aspectRatio}${prompt.includes('TEXT OVERLAY') ? ', text overlay' : ''}${prompt.includes('FINAL FRAMING') ? ', single-product framing' : ''}`);
 
     // Build CLI arguments
     const args = ['generate', 'create', model, '--prompt', prompt];
@@ -128,7 +143,7 @@ export async function POST(request) {
       { status: 500 }
     );
   } finally {
-    activeGenerations--;
+    releaseSlot();
     if (tempDir) {
       rm(tempDir, { recursive: true, force: true }).catch(() => {});
     }

@@ -76,11 +76,20 @@ export async function POST(request) {
   // Remap scene keys back to the CSV column headers the Apps Script expects.
   // buildPrompt reads CSV columns "rooms" and "styles" into scene keys
   // "room_type" and "style_tags" — reverse that for the write.
+  // buildPrompt swapped this scene's style fields for another style's look (lib/styleProfiles.js);
+  // writing them back would overwrite the original row with that style's values.
+  if (scene.adapted_style) {
+    return NextResponse.json(
+      { error: `This scene was adapted to ${scene.adapted_style}, so syncing would overwrite the original sheet row with ${scene.adapted_style} values. Sync is off for adapted scenes.` },
+      { status: 409 }
+    );
+  }
+
   const KEY_TO_HEADER = {
     room_type:  'rooms',
     style_tags: 'styles',
   };
-  const SKIP_KEYS = new Set(['accessories']); // not on the scenes sheet
+  const SKIP_KEYS = new Set(['accessories', 'design_style', 'adapted_style']); // not on the scenes sheet
 
   const mapped = {};
   for (const [key, value] of Object.entries(scene)) {

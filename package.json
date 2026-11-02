@@ -1,13 +1,15 @@
 {
   "name": "app-room-ideas",
   "version": "1.0.0",
-  "description": "HTGT Furniture room ideas generator — Vercel web app",
+  "description": "HTGT Furniture room ideas generator \u2014 Vercel web app",
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev -p 3456",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "audit:combos": "node --env-file=.env.local scripts/audit-combinations.mjs",
+    "vendor:demand": "node --env-file=.env.local scripts/vendor-demand.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.117.1",

@@ -2,7 +2,7 @@ import { graphqlRequest } from '../../../../lib/shopify.js';
 
 const SEARCH_QUERY = `
   query searchProducts($query: String) {
-    products(first: 25, sortKey: UPDATED_AT, reverse: true, query: $query) {
+    products(first: 25, sortKey: CREATED_AT, reverse: true, query: $query) {
       edges {
         node {
           id

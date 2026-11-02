@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { getConfig, saveConfig } from '../../../lib/config.js';
 
 // Fields exposed to the UI — omit productTypeCombinations and higgsfield internals
-const CRITERIA_KEYS = ['includeVendors', 'excludeTags', 'requireInventory', 'maxImagesPerProduct', 'accessories'];
+const CRITERIA_KEYS = ['includeVendors', 'excludeTags', 'requireInventory', 'maxImagesPerProduct', 'accessories', 'pinterestHashtags'];
 
 export async function GET() {
   const config = getConfig();

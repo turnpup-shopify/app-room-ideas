@@ -1,25 +1,8 @@
 import { NextResponse } from 'next/server';
 import Anthropic from '@anthropic-ai/sdk';
 import { graphqlRequest } from '../../../lib/shopify.js';
-
-const STAGED_UPLOADS_CREATE = `
-  mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
-    stagedUploadsCreate(input: $input) {
-      stagedTargets {
-        resourceUrl
-        url
-        parameters {
-          name
-          value
-        }
-      }
-      userErrors {
-        field
-        message
-      }
-    }
-  }
-`;
+import { fetchCleanImage } from '../../../lib/cleanImage.js';
+import { stageImageUpload } from '../../../lib/shopifyUpload.js';
 
 const FILE_CREATE = `
   mutation fileCreate($files: [FileCreateInput!]!) {
@@ -195,13 +178,14 @@ async function generateRoomDescription({ style, scene, products, roomName }) {
       const client = new Anthropic({ apiKey });
       const message = await client.messages.create({
         model: 'claude-haiku-4-5',
-        max_tokens: 180,
+        max_tokens: 100,
         messages: [{
           role: 'user',
-          content: `Write a 2–3 sentence room description for a furniture brand's website. ` +
+          content: `Write a room description for a furniture brand's website. 40 words max. ` +
             `Match the register of Dwell magazine: specific, direct, present tense, third person. ` +
             `Name the actual materials, light quality, or spatial character — not abstractions. ` +
             `\n\nHard rules:\n` +
+            `- 40 words or fewer. No exceptions.\n` +
             `- No superlatives or praise words: perfect, stunning, beautiful, incredible, amazing, exceptional\n` +
             `- No banned words: delve, foster, leverage, utilize, facilitate, empower, streamline, robust, ` +
             `cutting-edge, tapestry, realm, beacon, multifaceted, meticulous, intricate, paramount, ` +
@@ -263,56 +247,18 @@ export async function POST(request) {
     console.log('[publish] Room description:', description);
 
     // 2. Download the generated image from Higgsfield CDN
-    const imageRes = await fetch(imageUrl);
-    if (!imageRes.ok) {
-      throw new Error(`Failed to download image: ${imageRes.status}`);
-    }
-    const imageBuffer = Buffer.from(await imageRes.arrayBuffer());
-    const contentType = imageRes.headers.get('content-type') || 'image/png';
-    const ext = contentType.includes('jpeg') || contentType.includes('jpg') ? 'jpg' : 'png';
+    //    and strip its metadata before it goes to Shopify
+    const { buffer: imageBuffer, contentType, ext } = await fetchCleanImage(imageUrl);
     const filename = `${roomName.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.${ext}`;
 
-    // 3. Stage upload
-    const stagedData = await graphqlRequest(domain, token, STAGED_UPLOADS_CREATE, {
-      input: [{
-        resource: 'IMAGE',
-        filename,
-        mimeType: contentType,
-        httpMethod: 'POST',
-        fileSize: String(imageBuffer.length),
-      }],
-    });
-
-    const target = stagedData.stagedUploadsCreate.stagedTargets?.[0];
-    const stagedErrors = stagedData.stagedUploadsCreate.userErrors;
-    if (stagedErrors?.length > 0) {
-      throw new Error(`Staged upload error: ${stagedErrors.map(e => e.message).join(', ')}`);
-    }
-    if (!target) {
-      throw new Error('No staged upload target returned');
-    }
-
-    // 4. Upload image bytes via multipart form POST
-    const form = new FormData();
-    for (const param of target.parameters) {
-      form.append(param.name, param.value);
-    }
-    form.append('file', new Blob([imageBuffer], { type: contentType }), filename);
-
-    const uploadRes = await fetch(target.url, {
-      method: 'POST',
-      body: form,
-    });
-    if (!uploadRes.ok) {
-      const text = await uploadRes.text();
-      throw new Error(`Upload failed (${uploadRes.status}): ${text}`);
-    }
+    // 3–4. Stage upload and send the image bytes
+    const resourceUrl = await stageImageUpload(domain, token, { buffer: imageBuffer, filename, contentType });
 
     // 5. Register file via fileCreate
     const fileData = await graphqlRequest(domain, token, FILE_CREATE, {
       files: [{
         contentType: 'IMAGE',
-        originalSource: target.resourceUrl,
+        originalSource: resourceUrl,
         alt: roomName,
       }],
     });

@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getConfig } from '../../../lib/config.js';
-import { fetchProducts } from '../../../lib/shopify.js';
+import { fetchProducts, fetchProductByHandle } from '../../../lib/shopify.js';
 import { buildRooms } from '../../../lib/rules.js';
 import { buildPrompt } from '../../../lib/promptBuilder.js';
 
@@ -20,6 +20,22 @@ export async function POST(request) {
       );
     }
 
+    // Resolve featured product handles → full product objects
+    if (filters.featuredProducts?.length > 0) {
+      const resolved = [];
+      for (const handle of filters.featuredProducts) {
+        const featured = await fetchProductByHandle(handle);
+        if (!featured) {
+          return NextResponse.json(
+            { error: `Product not found for handle "${handle}". Check the handle in your Shopify admin URL.` },
+            { status: 404 }
+          );
+        }
+        resolved.push(featured);
+      }
+      filters.featuredProducts = resolved;
+    }
+
     const rooms = buildRooms(products, config, filters);
 
     if (rooms.length === 0) {
@@ -34,6 +50,7 @@ export async function POST(request) {
     const mapProduct = (p) => ({
       id: p.id,
       title: p.title,
+      handle: p.handle,
       productType: p.productType,
       materials: p.materials,
       dimensions: p.dimensions,
