@@ -244,9 +244,201 @@
     {
       "name": "Cozy Corner",
       "types": [
-        "Benches",
+        "Accent Chairs",
         "Table Lamps",
-        "Pillows"
+        "Wall Art"
+      ]
+    },
+    {
+      "name": "Living Room Art",
+      "types": [
+        "Coffee Tables",
+        "Wall Art",
+        "Table Lamps"
+      ]
+    },
+    {
+      "name": "Living Room Rug",
+      "types": [
+        "Coffee Tables",
+        "Rugs",
+        "Accent Chairs"
+      ]
+    },
+    {
+      "name": "Coffee Table Styling",
+      "types": [
+        "Coffee Tables",
+        "Table Accessories",
+        "Vases"
+      ]
+    },
+    {
+      "name": "Entryway Art",
+      "types": [
+        "Console Tables",
+        "Wall Art",
+        "Table Lamps"
+      ]
+    },
+    {
+      "name": "Bedroom Art",
+      "types": [
+        "Benches",
+        "Wall Art",
+        "Table Lamps"
+      ]
+    },
+    {
+      "name": "Bedroom Rug",
+      "types": [
+        "Benches",
+        "Rugs",
+        "Table Lamps"
+      ]
+    },
+    {
+      "name": "Sitting Room Art",
+      "types": [
+        "Accent Chairs",
+        "Accent Tables",
+        "Wall Art"
+      ]
+    },
+    {
+      "name": "Bar Cart Vignette",
+      "types": [
+        "Bar Cart",
+        "Trays",
+        "Wall Art"
+      ]
+    },
+    {
+      "name": "Home Office",
+      "types": [
+        "Accent Chairs",
+        "Table Lamps",
+        "Wall Art"
+      ]
+    },
+    {
+      "name": "Home Office Alt",
+      "types": [
+        "Console Tables",
+        "Table Lamps",
+        "Sculptures"
+      ]
+    },
+    {
+      "name": "Study",
+      "types": [
+        "Accent Chairs",
+        "Floor Lamps",
+        "Wall Art"
+      ]
+    },
+    {
+      "name": "Library",
+      "types": [
+        "Accent Chairs",
+        "Table Lamps",
+        "Sculptures"
+      ]
+    },
+    {
+      "name": "Bathroom",
+      "types": [
+        "Mirrors",
+        "Trays",
+        "Vases"
+      ]
+    },
+    {
+      "name": "Powder Room",
+      "types": [
+        "Mirrors",
+        "Lighting",
+        "Vases"
+      ]
+    },
+    {
+      "name": "Kitchen",
+      "types": [
+        "Bar and Counter Stools",
+        "Bowls",
+        "Vases"
+      ]
+    },
+    {
+      "name": "Mirror Vignette",
+      "types": [
+        "Mirrors",
+        "Console Tables",
+        "Vases"
+      ]
+    },
+    {
+      "name": "Corner Vignette",
+      "types": [
+        "Accent Chairs",
+        "Floor Lamps",
+        "Wall Art"
+      ]
+    },
+    {
+      "name": "Product Vignette",
+      "types": [
+        "Accent Tables",
+        "Sculptures",
+        "Vases"
+      ]
+    },
+    {
+      "name": "Gallery Room",
+      "types": [
+        "Benches",
+        "Wall Art",
+        "Sculptures"
+      ]
+    },
+    {
+      "name": "Living/Dining Combo",
+      "types": [
+        "Coffee Tables",
+        "Kitchen & Dining Room Chairs",
+        "Bowls"
+      ]
+    },
+    {
+      "name": "Alcove",
+      "types": [
+        "Accent Chairs",
+        "Accent Tables",
+        "Wall Art"
+      ]
+    },
+    {
+      "name": "Banquette",
+      "types": [
+        "Pillows",
+        "Accent Tables",
+        "Wall Art"
+      ]
+    },
+    {
+      "name": "Hotel Lobby",
+      "types": [
+        "Accent Chairs",
+        "Coffee Tables",
+        "Sculptures"
+      ]
+    },
+    {
+      "name": "Art Studio",
+      "types": [
+        "Benches",
+        "Wall Art",
+        "Floor Lamps"
       ]
     }
   ],
@@ -265,5 +457,175 @@
   "higgsfield": {
     "model": "nano_banana_2",
     "aspectRatio": "1:1"
-  }
+  },
+  "pinterestHashtags": [
+    "#TransitionalLivingRoom",
+    "#TransitionalBedroom",
+    "#TransitionalEntryway",
+    "#TransitionalDiningRoom",
+    "#TransitionalHomeOffice",
+    "#TransitionalBathroom",
+    "#TransitionalMirror",
+    "#TransitionalCoffeeTable",
+    "#TransitionalTableLamp",
+    "#TransitionalConsoleTable",
+    "#TransitionalAccentChair",
+    "#TransitionalWallArt",
+    "#OrganicModernLivingRoom",
+    "#OrganicModernBedroom",
+    "#OrganicModernEntryway",
+    "#OrganicModernDiningRoom",
+    "#OrganicModernHomeOffice",
+    "#OrganicModernBathroom",
+    "#OrganicModernMirror",
+    "#OrganicModernCoffeeTable",
+    "#OrganicModernTableLamp",
+    "#OrganicModernConsoleTable",
+    "#OrganicModernAccentChair",
+    "#OrganicModernWallArt",
+    "#ModernLivingRoom",
+    "#ModernBedroom",
+    "#ModernEntryway",
+    "#ModernDiningRoom",
+    "#ModernHomeOffice",
+    "#ModernBathroom",
+    "#ModernMirror",
+    "#ModernCoffeeTable",
+    "#ModernTableLamp",
+    "#ModernConsoleTable",
+    "#ModernAccentChair",
+    "#ModernWallArt",
+    "#CoastalLivingRoom",
+    "#CoastalBedroom",
+    "#CoastalEntryway",
+    "#CoastalDiningRoom",
+    "#CoastalHomeOffice",
+    "#CoastalBathroom",
+    "#CoastalMirror",
+    "#CoastalCoffeeTable",
+    "#CoastalTableLamp",
+    "#CoastalConsoleTable",
+    "#CoastalAccentChair",
+    "#CoastalWallArt",
+    "#TraditionalLivingRoom",
+    "#TraditionalBedroom",
+    "#TraditionalEntryway",
+    "#TraditionalDiningRoom",
+    "#TraditionalHomeOffice",
+    "#TraditionalBathroom",
+    "#TraditionalMirror",
+    "#TraditionalCoffeeTable",
+    "#TraditionalTableLamp",
+    "#TraditionalConsoleTable",
+    "#TraditionalAccentChair",
+    "#TraditionalWallArt",
+    "#RusticLivingRoom",
+    "#RusticBedroom",
+    "#RusticEntryway",
+    "#RusticDiningRoom",
+    "#RusticHomeOffice",
+    "#RusticBathroom",
+    "#RusticMirror",
+    "#RusticCoffeeTable",
+    "#RusticTableLamp",
+    "#RusticConsoleTable",
+    "#RusticAccentChair",
+    "#RusticWallArt",
+    "#FarmhouseLivingRoom",
+    "#FarmhouseBedroom",
+    "#FarmhouseEntryway",
+    "#FarmhouseDiningRoom",
+    "#FarmhouseHomeOffice",
+    "#FarmhouseBathroom",
+    "#FarmhouseMirror",
+    "#FarmhouseCoffeeTable",
+    "#FarmhouseTableLamp",
+    "#FarmhouseConsoleTable",
+    "#FarmhouseAccentChair",
+    "#FarmhouseWallArt",
+    "#GlamLivingRoom",
+    "#GlamBedroom",
+    "#GlamEntryway",
+    "#GlamDiningRoom",
+    "#GlamHomeOffice",
+    "#GlamBathroom",
+    "#GlamMirror",
+    "#GlamCoffeeTable",
+    "#GlamTableLamp",
+    "#GlamConsoleTable",
+    "#GlamAccentChair",
+    "#GlamWallArt",
+    "#IndustrialLivingRoom",
+    "#IndustrialBedroom",
+    "#IndustrialEntryway",
+    "#IndustrialDiningRoom",
+    "#IndustrialHomeOffice",
+    "#IndustrialBathroom",
+    "#IndustrialMirror",
+    "#IndustrialCoffeeTable",
+    "#IndustrialTableLamp",
+    "#IndustrialConsoleTable",
+    "#IndustrialAccentChair",
+    "#IndustrialWallArt",
+    "#ArtDecoLivingRoom",
+    "#ArtDecoBedroom",
+    "#ArtDecoEntryway",
+    "#ArtDecoDiningRoom",
+    "#ArtDecoHomeOffice",
+    "#ArtDecoBathroom",
+    "#ArtDecoMirror",
+    "#ArtDecoCoffeeTable",
+    "#ArtDecoTableLamp",
+    "#ArtDecoConsoleTable",
+    "#ArtDecoAccentChair",
+    "#ArtDecoWallArt",
+    "#FrenchCountryLivingRoom",
+    "#FrenchCountryBedroom",
+    "#FrenchCountryEntryway",
+    "#FrenchCountryDiningRoom",
+    "#FrenchCountryHomeOffice",
+    "#FrenchCountryBathroom",
+    "#FrenchCountryMirror",
+    "#FrenchCountryCoffeeTable",
+    "#FrenchCountryTableLamp",
+    "#FrenchCountryConsoleTable",
+    "#FrenchCountryAccentChair",
+    "#FrenchCountryWallArt",
+    "#MidCenturyModernLivingRoom",
+    "#MidCenturyModernBedroom",
+    "#MidCenturyModernEntryway",
+    "#MidCenturyModernDiningRoom",
+    "#MidCenturyModernHomeOffice",
+    "#MidCenturyModernBathroom",
+    "#MidCenturyModernMirror",
+    "#MidCenturyModernCoffeeTable",
+    "#MidCenturyModernTableLamp",
+    "#MidCenturyModernConsoleTable",
+    "#MidCenturyModernAccentChair",
+    "#MidCenturyModernWallArt",
+    "#BrutalistLivingRoom",
+    "#BrutalistBedroom",
+    "#BrutalistEntryway",
+    "#BrutalistDiningRoom",
+    "#BrutalistHomeOffice",
+    "#BrutalistBathroom",
+    "#BrutalistMirror",
+    "#BrutalistCoffeeTable",
+    "#BrutalistTableLamp",
+    "#BrutalistConsoleTable",
+    "#BrutalistAccentChair",
+    "#BrutalistWallArt",
+    "#ContemporaryLivingRoom",
+    "#ContemporaryBedroom",
+    "#ContemporaryEntryway",
+    "#ContemporaryDiningRoom",
+    "#ContemporaryHomeOffice",
+    "#ContemporaryBathroom",
+    "#ContemporaryMirror",
+    "#ContemporaryCoffeeTable",
+    "#ContemporaryTableLamp",
+    "#ContemporaryConsoleTable",
+    "#ContemporaryAccentChair",
+    "#ContemporaryWallArt"
+  ]
 }
